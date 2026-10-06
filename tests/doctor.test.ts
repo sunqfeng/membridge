@@ -4,18 +4,21 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { doctor } from '../src/doctor';
 import { LocalClient } from '../src/client';
+import { VERSION } from '../src/version';
 
 test('doctor infers cloud namespace/agent, emits portable configs without secrets and never creates cache', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'membridge-doctor-')); const cache = join(dir, 'private', 'cache.db');
   const token = 'private-token-' + 'a'.repeat(32);
   let calls = 0;
-  const transport = (async (_input: unknown, init: RequestInit) => {
-    calls++; expect((init.headers as Record<string, string>).authorization).toBe('Bearer ' + token);
-    return Response.json({ namespace: 'team', agent: 'research' });
+  const transport = (async (input: unknown, init: RequestInit) => {
+    calls++;
+    if (String(input).endsWith('/health')) return Response.json({ service: 'membridge', version: VERSION });
+    expect((init.headers as Record<string, string>).authorization).toBe('Bearer ' + token);
+    return Response.json({ namespace: 'team', agent: 'research', access: 'rw' });
   }) as unknown as typeof fetch;
   try {
     const result = await doctor({ env: { MEMBRIDGE_URL: 'http://localhost', MEMBRIDGE_TOKEN: token, MEMBRIDGE_CACHE_PATH: cache }, fetch: transport });
-    expect(result.ok).toBe(true); expect(calls).toBe(1);
+    expect(result.ok).toBe(true); expect(calls).toBe(2);
     expect(result.claudeConfig!.mcpServers.membridge.env.MEMBRIDGE_NAMESPACE).toBe('team');
     expect(result.claudeConfig!.mcpServers.membridge.env.MEMBRIDGE_AGENT).toBe('research');
     expect(result.codexConfig).toContain('MEMBRIDGE_NAMESPACE = "team"');
@@ -57,7 +60,7 @@ test('doctor reports unsafe URL, unauthorized and offline cloud without exposing
 test('doctor CLI emits pasteable TOML/JSON and returns failure exit code', async () => {
   const root = mkdtempSync(join(tmpdir(), 'membridge-doctor-cli-')), path = join(root, 'private', 'cache.db');
   const token = 'cli-token-' + 'z'.repeat(32);
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ namespace: 'team', agent: 'cli-agent' }) });
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: request => Response.json(new URL(request.url).pathname === '/health' ? { service: 'membridge', version: VERSION } : { namespace: 'team', agent: 'cli-agent', access: 'rw' }) });
   const execute = async (url: string) => {
     const subprocess = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), 'doctor'], {
       env: { MEMBRIDGE_URL: url, MEMBRIDGE_TOKEN: token, MEMBRIDGE_CACHE_PATH: path }, stdout: 'pipe', stderr: 'pipe',

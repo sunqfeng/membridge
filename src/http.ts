@@ -49,7 +49,7 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
       try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
       catch { throw new AppError('INVALID_JSON'); }
       switch (url.pathname) {
-        case '/v1/identity': return response({ namespace: actor.namespace, agent: actor.agent });
+        case '/v1/identity': return response({ namespace: actor.namespace, agent: actor.agent, access: actor.access ?? 'rw' });
         case '/v1/put': return response(await store.put(actor, putSchema.parse(input)));
         case '/v1/search': return response(await store.search(actor, searchSchema.parse(input)));
         case '/v1/recent': return response(await store.recent(actor, recentSchema.parse(input)));

@@ -1,4 +1,5 @@
 import { test, expect } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { LocalClient } from '../src/client';
@@ -16,7 +17,7 @@ test('MCP redistributes unused body budget and resumes a selected memory with of
   const server = createMcp(local), client = new Client({ name: 'test', version: '1' });
   const [left, right] = InMemoryTransport.createLinkedPair(); await server.connect(right); await client.connect(left);
   const read = async (ids: string[], offset = 0) => {
-    const response = await client.callTool({ name: 'get_memories', arguments: { project: 'demo', ids, charBudget: 1000, offset } });
+    const response = await client.callTool({ name: 'get_memories', arguments: { project: 'demo', ids, charBudget: 1000, offset, ...(offset > 0 ? { version: long.version, bodyHash: createHash('sha256').update(long.body).digest('hex') } : {}) } });
     return JSON.parse((response.content as { text: string }[])[0].text);
   };
   try {
@@ -70,9 +71,9 @@ test('recent needs no keyword, filters kind/expiry/deletion, scopes access and d
 });
 
 test('rebase previews without mutation, requires current confirmation and retains local text', async () => {
-  const store = new MemoryStore(sqliteDatabase(':memory:'));
+  const db = sqliteDatabase(':memory:'), store = new MemoryStore(db);
   const actor = { namespace: 'owner', agent: 'b', projects: ['demo'] }, token = 'a'.repeat(40);
-  const handle = createHandler(store, [{ ...actor, agent: 'a', token }]); let online = true;
+  const handle = createHandler(store, [{ ...actor, agent: 'a', token }]); let online = true, now = Date.now();
   let interleave: { id: string; expectedVersion: number } | undefined;
   const transport = (async (input: string | URL | Request, init?: RequestInit) => {
     if (!online) throw new Error('offline');
@@ -83,26 +84,37 @@ test('rebase previews without mutation, requires current confirmation and retain
     }
     return response;
   }) as typeof fetch;
-  const client = new LocalClient(':memory:', { agent: 'a', url: 'http://localhost', token, fetch: transport });
+  const client = new LocalClient(':memory:', { agent: 'a', url: 'http://localhost', token, fetch: transport, now: () => now });
   try {
     const saved = (await client.remember(draft('original'))).memory!;
     online = false; await client.remember({ ...draft('local revised'), id: saved.id }, 1);
     online = true;
     await store.put(actor, { operationId: crypto.randomUUID(), memory: { ...createMemory(draft('remote revised')), id: saved.id }, expectedVersion: 1 });
     await client.sync(); expect(client.status().conflicts).toBe(1);
-    const preview = await client.rebasePending('demo', saved.id);
+    await expect(client.rebasePending('demo', saved.id, 2)).rejects.toThrow('PREVIEW_CONFIRMATION_REQUIRED');
+    let preview = await client.rebasePending('demo', saved.id);
     expect(preview.localMemory.body).toBe('local revised'); expect(preview.cloudMemory.body).toBe('remote revised');
     expect(preview.expectedVersion).toBe(2); expect(client.status().conflicts).toBe(1);
+    await expect(client.rebasePending('demo', saved.id, 2, 'f'.repeat(64))).rejects.toThrow('INVALID_OR_EXPIRED_CONFIRM_TOKEN');
+    const payload = JSON.parse(String((await db.rows('SELECT payload FROM mb_memories WHERE id=?', [saved.id]))[0].payload));
+    payload.body = 'changed without version increment';
+    await db.run('UPDATE mb_memories SET payload=? WHERE id=?', [JSON.stringify(payload), saved.id]);
+    await expect(client.rebasePending('demo', saved.id, 2, preview.confirmToken)).rejects.toThrow('CLOUD_VERSION_CHANGED');
+    now += 600001;
+    await expect(client.rebasePending('demo', saved.id, 2, preview.confirmToken)).rejects.toThrow('INVALID_OR_EXPIRED_CONFIRM_TOKEN');
+    preview = await client.rebasePending('demo', saved.id);
     await store.put(actor, { operationId: crypto.randomUUID(), memory: { ...createMemory(draft('remote changed again')), id: saved.id }, expectedVersion: 2 });
-    await expect(client.rebasePending('demo', saved.id, 2)).rejects.toThrow('CLOUD_VERSION_CHANGED');
-    const confirmed = await client.rebasePending('demo', saved.id, 3);
+    await expect(client.rebasePending('demo', saved.id, 2, preview.confirmToken)).rejects.toThrow('CLOUD_VERSION_CHANGED');
+    const nextPreview = await client.rebasePending('demo', saved.id);
+    const confirmed = await client.rebasePending('demo', saved.id, 3, nextPreview.confirmToken);
     expect(confirmed.syncStatus).toBe('synced'); expect(confirmed.localMemory.body).toBe('local revised');
     expect((await store.get(actor, 'demo', [saved.id]))[0].body).toBe('local revised');
     await expect(client.rebasePending('demo', saved.id)).rejects.toThrow('CONFLICTED_PUT_REQUIRED');
     await store.put(actor, { operationId: crypto.randomUUID(), memory: createMemory({ ...draft('remote version 5'), id: saved.id }), expectedVersion: 4 });
     expect((await client.remember({ ...draft('local retry'), id: saved.id }, 4)).syncStatus).toBe('conflict');
+    const finalPreview = await client.rebasePending('demo', saved.id);
     interleave = { id: saved.id, expectedVersion: 5 };
-    expect((await client.rebasePending('demo', saved.id, 5)).syncStatus).toBe('conflict');
+    expect((await client.rebasePending('demo', saved.id, 5, finalPreview.confirmToken)).syncStatus).toBe('conflict');
     expect((await store.get(actor, 'demo', [saved.id]))[0].body).toBe('concurrent update');
     await store.forget(actor, { operationId: crypto.randomUUID(), project: 'demo', id: saved.id, expectedVersion: 6 });
     await expect(client.rebasePending('demo', saved.id)).rejects.toThrow('CLOUD_MEMORY_NOT_FOUND_OR_EXPIRED');

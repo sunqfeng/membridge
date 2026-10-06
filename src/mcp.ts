@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { LocalClient } from './client';
@@ -10,6 +11,7 @@ import { selectCachePath } from './cache';
 import { VERSION } from './version';
 import { diagnostic } from './diagnostics';
 import { clientConfig } from './config';
+import { resolveRuntimeIdentity } from './runtime-identity';
 
 export function createMcp(client: LocalClient) {
   const server = new McpServer({ name: 'membridge', version: VERSION }, {
@@ -30,10 +32,15 @@ export function createMcp(client: LocalClient) {
     inputSchema: recentSchema.extend({ refresh: z.boolean().default(false) }).shape, annotations: read,
   }, args => { const { refresh, ...request } = args; return safe(() => client.recent(request, refresh)); });
   server.registerTool('get_memories', {
-    description: 'Fetch selected details with a shared body budget, redistributing unused space. offset applies to each body in UTF-16 units. For truncated content, request its ID alone with offset=nextOffset; restart at 0 if version changed.',
-    inputSchema: getSchema.extend({ refresh: z.boolean().default(false), charBudget: z.number().int().min(1000).max(32000).default(12000), offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0) }).shape, annotations: read,
+    description: 'Fetch details with a shared body budget and surrogate-safe UTF-16 offsets. Continuation requires one ID, offset=nextOffset and first-page version. Also pass first-page bodyHash (required for pending local content). Changed versions or hashes are rejected.',
+    inputSchema: getSchema.extend({ refresh: z.boolean().default(false), charBudget: z.number().int().min(1000).max(32000).default(12000), offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), version: z.number().int().min(0).optional(), bodyHash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).shape, annotations: read,
   }, args => safe(async () => {
-    const result = await client.get(args.project, args.ids, args.refresh);
+    if (args.offset > 0 && (args.version === undefined || args.ids.length !== 1)) throw new AppError('PAGINATION_REQUIRES_SINGLE_ID_AND_VERSION');
+    const result = await client.get(args.project, args.ids, args.refresh || args.offset > 0);
+    if (args.offset > 0 && (result.cloudStatus === 'unavailable' || result.cloudStatus === 'not_configured') && !result.pendingIds.includes(args.ids[0])) throw new AppError('PAGINATION_CLOUD_UNAVAILABLE', 503);
+    if (args.offset > 0 && (result.results.length !== 1 || result.results[0].version !== args.version)) throw new AppError('PAGINATION_VERSION_CHANGED', 409);
+    if (args.offset > 0 && result.pendingIds.includes(args.ids[0]) && !args.bodyHash) throw new AppError('PAGINATION_PENDING_REQUIRES_BODY_HASH');
+    if (args.offset > 0 && args.bodyHash && createHash('sha256').update(result.results[0].body).digest('hex') !== args.bodyHash) throw new AppError('PAGINATION_VERSION_CHANGED', 409);
     const ordered = [...new Set(args.ids)].flatMap(id => result.results.filter(memory => memory.id === id));
     return { ...result, results: bodyPages(ordered, args.charBudget, args.offset) };
   }));
@@ -61,18 +68,20 @@ export function createMcp(client: LocalClient) {
     inputSchema: { project: projectSchema, id: z.uuid() }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, args => safe(() => client.discardPending(args.project, args.id)));
   server.registerTool('rebase_pending', {
-    description: 'Preview conflicted put alongside latest cloud memory, preserving local content. After review and explicit confirmation, call again with confirmVersion=expectedVersion to retry. Rejects changed/deleted cloud revisions; never automatically resolves conflicts.',
-    inputSchema: { project: projectSchema, id: z.uuid(), confirmVersion: z.number().int().min(1).optional() },
+    description: 'Preview conflicted put alongside latest cloud memory. After review and explicit confirmation, submit confirmVersion=expectedVersion and the preview confirmToken within 10 minutes. Token is single-use and bound to both contents; guessing versions cannot confirm. Rejects changed/deleted revisions.',
+    inputSchema: { project: projectSchema, id: z.uuid(), confirmVersion: z.number().int().min(1).optional(), confirmToken: z.string().regex(/^[a-f0-9]{64}$/).optional() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, args => safe(() => client.rebasePending(args.project, args.id, args.confirmVersion)));
+  }, args => safe(() => client.rebasePending(args.project, args.id, args.confirmVersion, args.confirmToken)));
   return server;
 }
 
 export async function startMcp() {
-  const { url, token, agent, namespace, ttlMs } = clientConfig();
+  const configuredPath = process.env.MEMBRIDGE_CACHE_PATH;
+  const identityDirectory = configuredPath ? configuredPath === ':memory:' ? null : dirname(resolve(configuredPath)) : join(homedir(), '.membridge');
+  const { url, token, agent, namespace, ttlMs } = await resolveRuntimeIdentity(clientConfig(), identityDirectory);
   const legacyPath = process.env.MEMBRIDGE_LEGACY_CACHE_PATH;
   const cachePath = process.env.MEMBRIDGE_CACHE_PATH ?? selectCachePath(join(homedir(), '.membridge'), { url, token, namespace, agent, legacyPath });
-  const client = new LocalClient(cachePath, { url, token, namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs });
+  const client = new LocalClient(cachePath, { url, token, namespace: process.env.MEMBRIDGE_NAMESPACE === undefined ? undefined : namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs });
   const server = createMcp(client);
   // Retry bounded batches; conflicts remain for deliberate resolution.
   void client.sync().catch(error => diagnostic('MemBridge initial sync failed', error));

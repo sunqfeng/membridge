@@ -34,6 +34,8 @@ test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotenc
   const a = new LocalClient(':memory:', { url: server.url.toString(), token: tokenA, namespace, agent: 'a' });
   const b = new LocalClient(':memory:', { url: server.url.toString(), token: tokenB, namespace, agent: 'b' });
   try {
+    const orderIndex = await db.rows("SHOW INDEX FROM mb_memories WHERE Key_name='mb_memories_recent'");
+    expect(orderIndex.map(row => row.Column_name)).toEqual(['namespace', 'project', 'deleted', 'updated_at', 'id']);
     expect((await store.put(actorA, fixturePut)).body).toBe(fixture.body);
     expect((await b.recent({ project: 'shared', kind: 'decision', limit: 10 })).results[0].id).toBe(fixture.id);
     let attempts = 0;
@@ -51,7 +53,7 @@ test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotenc
     expect((await a.remember({ ...revised, body: '保留本地修改' }, 1)).syncStatus).toBe('conflict');
     const preview = await a.rebasePending('shared', revised.id);
     expect(preview.expectedVersion).toBe(2);
-    expect((await a.rebasePending('shared', revised.id, preview.expectedVersion)).syncStatus).toBe('synced');
+    expect((await a.rebasePending('shared', revised.id, preview.expectedVersion, preview.confirmToken)).syncStatus).toBe('synced');
     const memory = createMemory({ project: 'shared', title: '共享 MySQL', body: '腾讯云中文记忆', kind: 'decision', sources: ['test:synthetic'] });
     const original = { operationId: crypto.randomUUID(), memory, expectedVersion: 0 };
     expect((await store.put(actorA, original)).version).toBe(1);

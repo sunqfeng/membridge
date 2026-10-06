@@ -9,10 +9,12 @@
 ```sql
 CREATE DATABASE membridge CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 CREATE USER 'membridge'@'127.0.0.1' IDENTIFIED BY 'REPLACE_WITH_STRONG_PASSWORD';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER ON membridge.* TO 'membridge'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON membridge.* TO 'membridge'@'127.0.0.1';
 ```
 
 服务首次启动自动创建 mb_scopes、mb_memories、mb_operations，并补 search_title/search_body 生成列。迁移需要 ALTER；完成后可撤销 ALTER。保留 CREATE 供启动执行 CREATE TABLE IF NOT EXISTS。不用 root 作为应用连接。密码中的 @、:、/ 等要 URL 编码。
+
+0.1.3 启动还会创建 mb_memories_recent(namespace,project,deleted,updated_at,id)，需要 INDEX 权限；成功建好后可以撤销 INDEX。它支持按项目和更新时间排序，LIKE 子串检索仍可能扫描整个项目，不能替代 FULLTEXT。
 
 ## 2. 配置服务与 agent
 
