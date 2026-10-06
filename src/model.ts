@@ -11,6 +11,7 @@ export const draftSchema = z.object({
 export const memoryInputSchema = draftSchema.extend({ id: z.uuid() });
 export const putSchema = z.object({ operationId: z.uuid(), memory: memoryInputSchema, expectedVersion: z.number().int().min(0) }).strict();
 export const searchSchema = z.object({ project: projectSchema, query: z.string().trim().min(1).max(200), limit: z.number().int().min(1).max(30).default(10) }).strict();
+export const recentSchema = z.object({ project: projectSchema, kind: draftSchema.shape.kind.optional(), limit: z.number().int().min(1).max(30).default(10) }).strict();
 export const getSchema = z.object({ project: projectSchema, ids: z.array(z.uuid()).min(1).max(20) }).strict();
 export const timelineSchema = z.object({ project: projectSchema, anchor: z.uuid(), depth: z.number().int().min(1).max(10).default(3) }).strict();
 export const forgetSchema = z.object({ operationId: z.uuid(), project: projectSchema, id: z.uuid(), expectedVersion: z.number().int().min(1) }).strict();
@@ -21,6 +22,7 @@ export type Principal = { namespace: string; agent: string; projects: string[]; 
 export type Put = z.infer<typeof putSchema>;
 export type Forget = z.infer<typeof forgetSchema>;
 export type Search = z.infer<typeof searchSchema>;
+export type Recent = z.infer<typeof recentSchema>;
 export class AppError extends Error {
   constructor(public code: string, public status = 400) { super(code); }
 }

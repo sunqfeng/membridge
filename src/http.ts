@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
-import { AppError, type Principal, projectSchema, putSchema, searchSchema, getSchema, timelineSchema, forgetSchema } from './model';
+import { AppError, type Principal, projectSchema, putSchema, searchSchema, recentSchema, getSchema, timelineSchema, forgetSchema } from './model';
 import { MemoryStore } from './store';
 import { VERSION } from './version';
 import { diagnostic } from './diagnostics';
@@ -52,6 +52,7 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
         case '/v1/identity': return response({ namespace: actor.namespace, agent: actor.agent });
         case '/v1/put': return response(await store.put(actor, putSchema.parse(input)));
         case '/v1/search': return response(await store.search(actor, searchSchema.parse(input)));
+        case '/v1/recent': return response(await store.recent(actor, recentSchema.parse(input)));
         case '/v1/get': { const args = getSchema.parse(input); return response(await store.get(actor, args.project, args.ids)); }
         case '/v1/timeline': { const args = timelineSchema.parse(input); return response(await store.timeline(actor, args.project, args.anchor, args.depth)); }
         case '/v1/forget': return response(await store.forget(actor, forgetSchema.parse(input)));

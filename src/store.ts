@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { type SqlDatabase, type SqlConnection } from './database';
-import { AppError, active, authorize, authorizeWrite, createMemory, index, type Principal, type Memory, type Put, type Forget, type Search } from './model';
+import { AppError, active, authorize, authorizeWrite, createMemory, index, type Principal, type Memory, type Put, type Forget, type Search, type Recent } from './model';
 
 export class MemoryStore {
   constructor(private db: SqlDatabase) {}
@@ -55,22 +55,29 @@ export class MemoryStore {
     return rows.map(row => JSON.parse(String(row.payload)) as Memory).filter(memory => active(memory));
   }
   async search(actor: Principal, request: Search) {
-    authorize(actor, request.project);
     const query = request.query.toLocaleLowerCase();
     const escaped = query.replace(/[!%_]/g, character => '!' + character);
     const text = this.db.dialect === 'mysql' ? "CONCAT(COALESCE(search_title,''),CHAR(10),COALESCE(search_body,''))" : "COALESCE(search_title,'') || char(10) || COALESCE(search_body,'')";
+    return this.indexes(actor, request, ` AND LOWER(${text}) LIKE ? ESCAPE '!'`, ['%' + escaped + '%'], memory => (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query));
+  }
+  async recent(actor: Principal, request: Recent) {
+    const kind = this.db.dialect === 'mysql' ? "JSON_UNQUOTE(JSON_EXTRACT(payload,'$.kind'))" : "json_extract(payload,'$.kind')";
+    return this.indexes(actor, request, request.kind ? ` AND ${kind}=?` : '', request.kind ? [request.kind] : []);
+  }
+  private async indexes(actor: Principal, request: { project: string; limit: number }, condition: string, values: string[], matches: (memory: Memory) => boolean = () => true) {
+    authorize(actor, request.project);
     const results: Memory[] = [];
     let cursor: { time: number; id: string } | undefined;
     const now = Date.now();
     while (results.length < request.limit) {
       const where = cursor ? ' AND (updated_at<? OR (updated_at=? AND id<?))' : '';
-      const args: (string | number)[] = [actor.namespace, request.project, '%' + escaped + '%'];
+      const args: (string | number)[] = [actor.namespace, request.project, ...values];
       if (cursor) args.push(cursor.time, cursor.time, cursor.id);
-      const rows = await this.db.rows(`SELECT payload,updated_at,id FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND LOWER(${text}) LIKE ? ESCAPE '!'${where} ORDER BY updated_at DESC,id DESC LIMIT 100`, args);
+      const rows = await this.db.rows(`SELECT payload,updated_at,id FROM mb_memories WHERE namespace=? AND project=? AND deleted=0${condition}${where} ORDER BY updated_at DESC,id DESC LIMIT 100`, args);
       if (!rows.length) break;
       for (const row of rows) {
         const memory = JSON.parse(String(row.payload)) as Memory;
-        if (active(memory, now) && (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query)) results.push(memory);
+        if (active(memory, now) && matches(memory)) results.push(memory);
         if (results.length === request.limit) break;
       }
       const last = rows[rows.length - 1]; cursor = { time: Number(last.updated_at), id: String(last.id) };

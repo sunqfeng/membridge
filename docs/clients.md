@@ -2,6 +2,10 @@
 
 每个客户端安装 Bun，克隆仓库并 `bun install --frozen-lockfile`。云服务启动后，每个 agent 使用自己的令牌和相同项目 slug；namespace/项目权限由服务端令牌配置决定。
 
+推荐先运行 `bun run doctor`（等价于 `bun src/cli.ts doctor`）。它读取当前 MEMBRIDGE_* 环境变量，检查 URL、授权连通、namespace/agent、缓存身份和 Unix 权限，输出可复制的 Codex TOML/通用 MCP JSON，自动填入本机 Bun 和 CLI 绝对路径。未指定 namespace/agent 时从令牌身份推导，已指定但不匹配则失败；失败退出码 1。
+
+输出不含令牌：启动 Codex/其他 MCP 客户端的环境必须提供 MEMBRIDGE_TOKEN；若使用客户端私有配置保存令牌，则仅在本机加入 env.MEMBRIDGE_TOKEN。合并已有 MCP 配置，不覆盖其他服务。doctor 只读诊断，不导入旧缓存、同步或改权限；权限错误需修正专用缓存目录后重跑。Windows ACL 需在本机确认。没有 URL/token 是本地模式，会明确说明尚不可共享。
+
 ## Codex
 
 运行 `bun scripts/install-skill.ts codex`，然后在你的 Codex MCP 配置中添加以下片段（合并已有配置，不覆盖）：

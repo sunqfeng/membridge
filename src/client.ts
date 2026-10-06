@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { cacheIdentity, legacyIdentity, secureCache } from './cache';
-import { AppError, active, createMemory, index, type Memory, type IndexEntry, type Search, type Put, type Forget, type draftSchema } from './model';
+import { AppError, active, createMemory, index, type Memory, type IndexEntry, type Search, type Recent, type Put, type Forget, type draftSchema } from './model';
 import type { z } from 'zod';
 
 type Options = { url?: string; token?: string; namespace?: string; agent: string; migrateLegacy?: boolean; ttlMs?: number; fetch?: typeof fetch; now?: () => number };
@@ -173,6 +173,13 @@ export class LocalClient {
   }
   async search(request: Search, refresh = false): Promise<SearchReply> {
     const key = JSON.stringify([request.query, request.limit]);
+    const query = request.query.toLocaleLowerCase();
+    return this.readIndexes('search', request, key, refresh, memory => (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query));
+  }
+  async recent(request: Recent, refresh = false): Promise<SearchReply> {
+    return this.readIndexes('recent', request, JSON.stringify(['recent', request.kind ?? null, request.limit]), refresh, memory => !request.kind || memory.kind === request.kind);
+  }
+  private async readIndexes(path: 'search' | 'recent', request: Search | Recent, key: string, refresh: boolean, matches: (memory: Memory) => boolean): Promise<SearchReply> {
     const snapshot = this.db.query('SELECT payload,fetched_at FROM snapshots WHERE project=? AND key=?').get(request.project, key) as { payload: string; fetched_at: number } | null;
     let results = snapshot ? JSON.parse(snapshot.payload) as IndexEntry[] : [];
     let source: SearchReply['source'] = 'local';
@@ -181,16 +188,28 @@ export class LocalClient {
     if (refresh || !fresh || results.length === 0) {
       try {
         await this.verifyIdentity();
-        results = await this.call<IndexEntry[]>('search', request);
+        results = await this.call<IndexEntry[]>(path, request);
         this.db.query('INSERT INTO snapshots(project,key,payload,fetched_at) VALUES(?,?,?,?) ON CONFLICT(project,key) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at').run(request.project, key, JSON.stringify(results), this.now());
         source = 'cloud'; cloudStatus = 'fresh'; fresh = true;
         this.prune();
-      } catch (error) { this.offline(error); cloudStatus = this.configured() ? 'unavailable' : 'not_configured'; }
+      } catch (error) {
+        this.offline(error); cloudStatus = this.configured() ? 'unavailable' : 'not_configured'; fresh = false;
+        if (path === 'recent') {
+          const cached = this.db.query('SELECT payload FROM cache WHERE project=? AND pending=0').all(request.project) as { payload: string }[];
+          const known = new Map(results.map(item => [item.id, item]));
+          for (const row of cached) {
+            const memory = JSON.parse(row.payload) as Memory;
+            if (matches(memory) && (!known.has(memory.id) || known.get(memory.id)!.version < memory.version)) known.set(memory.id, index(memory));
+          }
+          results = [...known.values()];
+        }
+      }
     }
     const overlay = this.overlays(request.project);
-    const query = request.query.toLocaleLowerCase();
-    const local = overlay.pending.filter(memory => active(memory, this.now()) && (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query)).map(index);
-    results = [...local, ...results.filter(memory => !overlay.hidden.has(memory.id) && active(memory as Memory, this.now()))].slice(0, request.limit);
+    const local = overlay.pending.filter(memory => active(memory, this.now()) && matches(memory)).map(index);
+    results = [...local, ...results.filter(memory => !overlay.hidden.has(memory.id) && active(memory as Memory, this.now()))];
+    if (path === 'recent') results.sort((a, b) => b.updatedAt - a.updatedAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    results = results.slice(0, request.limit);
     return { results, source, cloudStatus, freshness: fresh ? 'fresh' : 'stale', pendingIds: overlay.pendingIds };
   }
   async get(project: string, ids: string[], refresh = false) {
@@ -225,6 +244,28 @@ export class LocalClient {
     // Timeline is always cloud refreshed, preventing a partial cache from pretending to be complete.
     await this.verifyIdentity();
     return { results: await this.call<IndexEntry[]>('timeline', { project, anchor, depth }), source: 'cloud' };
+  }
+  async rebasePending(project: string, id: string, confirmVersion?: number) {
+    const row = this.db.query("SELECT * FROM outbox WHERE project=? AND memory_id=? AND kind='put' AND status='conflict'").get(project, id) as QueueRow | null;
+    const cached = this.local(project, id);
+    if (!row || !cached) throw new AppError('CONFLICTED_PUT_REQUIRED', 409);
+    const localMemory = JSON.parse(cached.payload) as Memory;
+    await this.verifyIdentity();
+    // Bypass get()'s local overlay: review the actual cloud revision.
+    const cloudMemory = (await this.call<Memory[]>('get', { project, ids: [id] }))[0];
+    if (!cloudMemory) throw new AppError('CLOUD_MEMORY_NOT_FOUND_OR_EXPIRED', 404);
+    if (confirmVersion === undefined) return { localMemory, cloudMemory, expectedVersion: cloudMemory.version, requiresConfirmation: true };
+    if (confirmVersion !== cloudMemory.version) throw new AppError('CLOUD_VERSION_CHANGED', 409);
+    const operation = { ...JSON.parse(row.payload) as Put, expectedVersion: cloudMemory.version, operationId: crypto.randomUUID() };
+    this.db.transaction(() => {
+      const current = this.db.query('SELECT status FROM outbox WHERE operation_id=?').get(row.operation_id) as { status: string } | null;
+      if (current?.status !== 'conflict') throw new AppError('PENDING_OPERATION_CHANGED', 409);
+      this.db.query("UPDATE outbox SET operation_id=?,payload=?,status='pending' WHERE operation_id=?").run(operation.operationId, JSON.stringify(operation), row.operation_id);
+      this.cachedPut({ ...localMemory, version: cloudMemory.version, createdAt: cloudMemory.createdAt, updatedAt: this.now() }, true);
+      this.clearSnapshots(project);
+    })();
+    await this.sync();
+    return { localMemory: JSON.parse(this.local(project, id)?.payload ?? JSON.stringify(localMemory)) as Memory, cloudMemory, expectedVersion: cloudMemory.version, requiresConfirmation: false, syncStatus: this.syncStatus(project, id) };
   }
   discardPending(project: string, id: string) {
     this.db.transaction(() => {

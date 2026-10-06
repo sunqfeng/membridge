@@ -24,3 +24,16 @@ test('two authenticated agents share a project, with boundary validation and acc
   expect((await call('search', { project: 'shared', query: 'x'.repeat(150000) })).status).toBe(413);
   await store.close();
 });
+
+test('authenticated rate limit triggers after 120 requests and recent validates scope/input', async () => {
+  const store = new MemoryStore(sqliteDatabase(':memory:')), token = 'r'.repeat(40);
+  const handle = createHandler(store, [{ token, namespace: 'owner', agent: 'a', projects: ['demo'], access: 'ro' }]);
+  const call = (path: string, body: unknown) => handle(new Request('http://localhost/v1/' + path, { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+  try {
+    expect((await call('recent', { project: 'other' })).status).toBe(403);
+    expect((await call('recent', { project: 'demo', kind: 'invalid' })).status).toBe(400);
+    for (let i = 0; i < 118; i++) expect((await call('identity', {})).status).toBe(200);
+    const limited = await call('identity', {});
+    expect(limited.status).toBe(429); expect((await limited.json()).error.code).toBe('RATE_LIMITED');
+  } finally { await store.close(); }
+});
