@@ -10,6 +10,45 @@ import { LocalClient } from '../src/client';
 const url = process.env.MEMBRIDGE_TEST_MYSQL_URL;
 if (url && !new URL(url).pathname.slice(1).startsWith('membridge_test')) throw new Error('MySQL tests require a dedicated membridge_test* database');
 
+const adminUrl = process.env.MEMBRIDGE_TEST_MYSQL_ADMIN_URL;
+if (adminUrl && !new URL(adminUrl).pathname.slice(1).startsWith('membridge_test')) throw new Error('Migration grant tests require a dedicated membridge_test* admin database');
+test.skipIf(!adminUrl)('real MySQL migration needs ALTER and INDEX; restricted app account works after revoking both', async () => {
+  const suffix = crypto.randomUUID().replaceAll('-', '');
+  const database = 'membridge_test_grants_' + suffix, user = 'mb_' + suffix.slice(0, 20), password = crypto.randomUUID();
+  const account = `'${user}'@'%'`;
+  const admin = await mysql.createConnection(adminUrl!);
+  let db: Awaited<ReturnType<typeof mysqlDatabase>> | undefined;
+  try {
+    await admin.query(`CREATE DATABASE ${database} CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`);
+    await admin.query(`USE ${database}`);
+    for (const sql of schema) await admin.query(sql);
+    await admin.query(`CREATE USER ${account} IDENTIFIED BY ?`, [password]);
+    await admin.query(`GRANT SELECT,INSERT,UPDATE,DELETE,CREATE ON ${database}.* TO ${account}`);
+    const restricted = new URL(adminUrl!); restricted.username = user; restricted.password = password; restricted.pathname = '/' + database;
+    const denied = async () => {
+      try { const opened = await mysqlDatabase(restricted.toString()); await opened.close(); throw new Error('Migration unexpectedly succeeded'); }
+      catch (error) { expect((error as { errno?: number }).errno).toBe(1142); }
+    };
+    await denied(); // Missing ALTER for generated columns.
+    await admin.query(`GRANT ALTER ON ${database}.* TO ${account}`);
+    await denied(); // Columns can migrate now; CREATE INDEX still lacks INDEX.
+    await admin.query(`GRANT INDEX ON ${database}.* TO ${account}`);
+    db = await mysqlDatabase(restricted.toString());
+    expect(await db.rows("SHOW INDEX FROM mb_memories WHERE Key_name='mb_memories_recent'")).toHaveLength(5);
+    await db.close(); db = undefined;
+    await admin.query(`REVOKE ALTER,INDEX ON ${database}.* FROM ${account}`);
+    db = await mysqlDatabase(restricted.toString());
+    const store = new MemoryStore(db), actor = { namespace: 'team', agent: 'test', projects: ['demo'] };
+    const memory = createMemory({ project: 'demo', title: 'migration grants', body: '生成列和索引迁移成功', kind: 'decision', sources: ['test:grants'] });
+    await store.put(actor, { operationId: crypto.randomUUID(), memory, expectedVersion: 0 });
+    expect((await store.search(actor, { project: 'demo', query: '迁移成功', limit: 5 }))[0].id).toBe(memory.id);
+  } finally {
+    await db?.close();
+    try { await admin.query(`DROP USER IF EXISTS ${account}`); await admin.query(`DROP DATABASE IF EXISTS ${database}`); }
+    finally { await admin.end(); }
+  }
+}, 30000);
+
 test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotency, case-sensitive isolation and deletion replay', async () => {
   const namespace = 'test-' + crypto.randomUUID();
   // On a fresh CI database this is exactly the pre-generated-column schema.

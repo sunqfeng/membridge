@@ -78,14 +78,15 @@ export function createMcp(client: LocalClient) {
 export async function startMcp() {
   const configuredPath = process.env.MEMBRIDGE_CACHE_PATH;
   const identityDirectory = configuredPath ? configuredPath === ':memory:' ? null : dirname(resolve(configuredPath)) : join(homedir(), '.membridge');
-  const { url, token, agent, namespace, ttlMs } = await resolveRuntimeIdentity(clientConfig(), identityDirectory);
+  const runtime = await resolveRuntimeIdentity(clientConfig(), identityDirectory);
+  const { url, token, agent, namespace, ttlMs } = runtime;
   const legacyPath = process.env.MEMBRIDGE_LEGACY_CACHE_PATH;
   const cachePath = process.env.MEMBRIDGE_CACHE_PATH ?? selectCachePath(join(homedir(), '.membridge'), { url, token, namespace, agent, legacyPath });
-  const client = new LocalClient(cachePath, { url, token, namespace: process.env.MEMBRIDGE_NAMESPACE === undefined ? undefined : namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs });
+  const client = new LocalClient(cachePath, { url, token, namespace: process.env.MEMBRIDGE_NAMESPACE === undefined ? undefined : namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs, identityUnavailable: runtime.identityUnavailable });
   const server = createMcp(client);
   // Retry bounded batches; conflicts remain for deliberate resolution.
-  void client.sync().catch(error => diagnostic('MemBridge initial sync failed', error));
-  const timer = setInterval(() => { void client.sync().catch(error => diagnostic('MemBridge sync failed', error)); }, 30000);
+  void client.sync({ retryIdentity: false }).catch(error => diagnostic('MemBridge initial sync failed', error));
+  const timer = setInterval(() => { void client.sync({ retryIdentity: false }).catch(error => diagnostic('MemBridge sync failed', error)); }, 30000);
   timer.unref();
   const shutdown = async () => { clearInterval(timer); await server.close(); client.close(); process.exit(0); };
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

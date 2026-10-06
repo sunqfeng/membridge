@@ -90,7 +90,7 @@ test('automatic namespace migrates unbound pending cache and offline restarts re
     local = new LocalClient(selectCachePath(root, cached), { ...config, fetch: offline });
     expect(local.status().namespace).toBe('team'); await local.remember(draft('offline after discovery')); local.close();
     local = new LocalClient(path, { ...config, fetch: transport }); expect((await local.sync()).pending).toBe(0); local.close();
-    await expect(resolveRuntimeIdentity({ ...config, token: 'other'.repeat(8) }, root, offline)).rejects.toThrow('CLOUD_IDENTITY_REQUIRED_FIRST_CONNECTION');
+    expect((await resolveRuntimeIdentity({ ...config, token: 'other'.repeat(8) }, root, offline)).namespace).toBeUndefined();
   } finally { await store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -135,4 +135,5 @@ test('doctor warns about read-only credentials and rejects old server versions',
   expect(old.ok).toBe(false); expect(old.checks.some(check => check.code === 'SERVER_VERSION_TOO_OLD')).toBe(true);
   const current = await doctor({ env, fetch: transport(VERSION) });
   expect(current.ok).toBe(true); expect(current.checks.some(check => check.code === 'ACCESS_READ_ONLY')).toBe(true);
+  expect((await doctor({ env, fetch: transport('0.1.3') })).ok).toBe(true);
 });

@@ -41,7 +41,7 @@ export function redact(value: string): string {
   return value
     .replace(/<private\b[^>]*>[\s\S]*?(?:<\/private\s*>|$)/gi, '[private_omitted]')
     .replace(/-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g, '[redacted]')
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*:[^\s@]*@/gi, '$1[redacted]@')
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*:[^\s/@]*@/gi, '$1[redacted]@')
     .replace(/\bAKID[A-Za-z0-9]{16,}\b/g, '[redacted]')
     .replace(/\bLTAI[A-Za-z0-9]{12,}\b/g, '[redacted]')
     .replace(/(["']?authorization["']?\s*[:=]\s*["']?)(?:Bearer|Basic|Token)\s+[^\s"',;}]+/gi, '$1[redacted]')

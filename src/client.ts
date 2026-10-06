@@ -4,7 +4,7 @@ import { cacheIdentity, legacyIdentity, secureCache } from './cache';
 import { AppError, active, createMemory, index, identitySchema, type Memory, type IndexEntry, type Search, type Recent, type Put, type Forget, type draftSchema } from './model';
 import type { z } from 'zod';
 
-type Options = { url?: string; token?: string; namespace?: string; agent: string; migrateLegacy?: boolean; ttlMs?: number; fetch?: typeof fetch; now?: () => number };
+type Options = { url?: string; token?: string; namespace?: string; agent: string; migrateLegacy?: boolean; ttlMs?: number; fetch?: typeof fetch; now?: () => number; identityUnavailable?: boolean };
 type QueueRow = { operation_id: string; project: string; memory_id: string; kind: 'put' | 'forget'; payload: string; status: string };
 type Cached = { payload: string; fetched_at: number; pending: number };
 type SearchReply = { results: IndexEntry[]; source: 'local' | 'cloud'; cloudStatus: 'fresh' | 'not_checked' | 'unavailable' | 'not_configured'; freshness: 'fresh' | 'stale'; pendingIds: string[] };
@@ -19,6 +19,8 @@ export class LocalClient {
   private syncRequested = false;
   private retryFailedRequested = false;
   private verified = false;
+  private verifying?: Promise<void>;
+  private identityFailure?: { error: AppError; until: number };
   private currentNamespace: string;
   private namespaceBound: boolean;
   private access: 'ro' | 'rw' | 'unknown' = 'unknown';
@@ -58,10 +60,22 @@ export class LocalClient {
     if (!Number.isFinite(this.ttlMs) || this.ttlMs < 0 || this.ttlMs > 3600000) { this.db.close(); throw new AppError('INVALID_CACHE_TTL'); }
     this.requestFetch = options.fetch ?? fetch;
     this.now = options.now ?? Date.now;
+    if (options.identityUnavailable) this.identityFailure = { error: new AppError('CLOUD_UNAVAILABLE', 503), until: this.now() + 5000 };
   }
   private configured() { return !!this.options.url && !!this.options.token; }
   private async verifyIdentity() {
     if (this.verified || !this.configured()) return;
+    if (this.verifying) return this.verifying;
+    if (this.identityFailure && this.now() < this.identityFailure.until) throw this.identityFailure.error;
+    this.verifying = this.bindIdentity().catch(error => {
+      if (error instanceof AppError && (error.status >= 500 || [408, 425, 429].includes(error.status))) {
+        this.identityFailure = { error, until: this.now() + 5000 };
+      }
+      throw error;
+    }).finally(() => { this.verifying = undefined; });
+    return this.verifying;
+  }
+  private async bindIdentity() {
     const identity = identitySchema.parse(await this.call<unknown>('identity', {}));
     if ((this.namespaceBound && identity.namespace !== this.currentNamespace) || identity.agent !== this.options.agent) throw new AppError('CLOUD_IDENTITY_MISMATCH', 403);
     this.db.transaction(() => {
@@ -74,6 +88,7 @@ export class LocalClient {
     })();
     this.currentNamespace = identity.namespace; this.namespaceBound = true; this.access = identity.access ?? 'unknown';
     this.verified = true;
+    this.identityFailure = undefined;
   }
   private async checkWritable() {
     try { await this.verifyIdentity(); } catch (error) { this.offline(error); }
@@ -123,7 +138,7 @@ export class LocalClient {
       this.db.query('INSERT INTO outbox(operation_id,project,memory_id,kind,payload) VALUES(?,?,?,?,?)').run(operation.operationId, draft.project, draft.id, 'put', JSON.stringify(operation));
       this.clearSnapshots(draft.project);
     })();
-    await this.sync();
+    await this.sync({ retryIdentity: false });
     const row = this.local(draft.project, draft.id);
     return { memory: row ? JSON.parse(row.payload) as Memory : null, syncStatus: this.syncStatus(draft.project, draft.id), access: this.access };
   }
@@ -140,10 +155,12 @@ export class LocalClient {
       this.clearSnapshots(project);
       this.db.query('INSERT INTO outbox(operation_id,project,memory_id,kind,payload) VALUES(?,?,?,?,?)').run(operation.operationId, project, id, 'forget', JSON.stringify(operation));
     })();
-    await this.sync();
+    await this.sync({ retryIdentity: false });
     return { id, syncStatus: this.syncStatus(project, id) };
   }
-  sync(options: { retryFailed?: boolean } = {}): Promise<ReturnType<LocalClient['status']>> {
+  sync(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}): Promise<ReturnType<LocalClient['status']>> {
+    // Explicit sync can probe recovery immediately; automatic writes share backoff.
+    if (options.retryIdentity !== false) this.identityFailure = undefined;
     this.syncRequested = true;
     this.retryFailedRequested ||= options.retryFailed ?? false;
     if (this.syncing) return this.syncing;
@@ -152,7 +169,7 @@ export class LocalClient {
         this.syncRequested = false;
         if (this.retryFailedRequested) {
           this.db.run("UPDATE outbox SET status='pending' WHERE status IN ('blocked','rejected')");
-          this.retryFailedRequested = false; this.verified = false;
+          this.retryFailedRequested = false; this.verified = false; this.identityFailure = undefined;
         }
         await this.drain();
       } while (this.syncRequested);
