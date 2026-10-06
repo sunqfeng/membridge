@@ -95,8 +95,17 @@ export class LocalClient {
     this.verified = true;
     this.identityFailure = undefined;
   }
-  private async checkWritable() {
-    try { await this.verifyIdentity(); } catch (error) { this.offline(error); }
+  private async checkWritable(deadline = Infinity) {
+    // Known read-only credentials never wait for the network or create a draft.
+    this.assertWritable();
+    try {
+      const verification = this.verifyIdentity();
+      if (Number.isFinite(deadline)) await this.waitWithinBudget(verification, deadline);
+      else await verification;
+    } catch (error) { this.offline(error); }
+    this.assertWritable();
+  }
+  private assertWritable() {
     if (this.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
     if (this.configured() && this.verified && this.access === 'unknown') throw new AppError('SERVER_ACCESS_UNAVAILABLE', 503);
   }
@@ -134,8 +143,9 @@ export class LocalClient {
   private clearSnapshots(project: string) { this.db.query('DELETE FROM snapshots WHERE project=?').run(project); }
   private unresolved(project: string, id: string) { return !!this.db.query('SELECT operation_id FROM outbox WHERE project=? AND memory_id=? LIMIT 1').get(project, id); }
   async remember(input: z.input<typeof draftSchema>, expectedVersion = 0) {
+    const deadline = performance.now() + 2000;
     const draft = createMemory(input);
-    await this.checkWritable();
+    await this.checkWritable(deadline);
     if (this.unresolved(draft.project, draft.id)) throw new AppError('PENDING_WRITE_EXISTS', 409);
     if (!Number.isInteger(expectedVersion) || expectedVersion < 0) throw new AppError('INVALID_VERSION');
     const old = this.local(draft.project, draft.id);
@@ -148,7 +158,7 @@ export class LocalClient {
       this.clearSnapshots(draft.project);
       this.prune();
     })();
-    await this.syncWithBudget({ retryIdentity: false });
+    await this.syncWithBudget({ retryIdentity: false }, deadline);
     const row = this.local(draft.project, draft.id);
     return { memory: row ? JSON.parse(row.payload) as Memory : null, syncStatus: this.syncStatus(draft.project, draft.id), access: this.access };
   }
@@ -157,7 +167,8 @@ export class LocalClient {
     return row?.status ?? 'synced';
   }
   async forget(project: string, id: string, expectedVersion: number) {
-    await this.checkWritable();
+    const deadline = performance.now() + 2000;
+    await this.checkWritable(deadline);
     if (this.unresolved(project, id)) throw new AppError('PENDING_WRITE_EXISTS', 409);
     const operation: Forget = { operationId: crypto.randomUUID(), project, id, expectedVersion };
     this.db.transaction(() => {
@@ -165,7 +176,7 @@ export class LocalClient {
       this.clearSnapshots(project);
       this.db.query('INSERT INTO outbox(operation_id,project,memory_id,kind,payload) VALUES(?,?,?,?,?)').run(operation.operationId, project, id, 'forget', JSON.stringify(operation));
     })();
-    await this.syncWithBudget({ retryIdentity: false });
+    await this.syncWithBudget({ retryIdentity: false }, deadline);
     return { id, syncStatus: this.syncStatus(project, id) };
   }
   sync(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}): Promise<ReturnType<LocalClient['status']>> {
@@ -188,11 +199,14 @@ export class LocalClient {
     })().finally(() => { this.syncing = undefined; });
     return this.syncing;
   }
-  async syncWithBudget(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}) {
+  private async waitWithinBudget(work: Promise<unknown>, deadline: number) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([this.sync(options), new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); })]);
+      await Promise.race([work, new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - performance.now())); })]);
     } finally { clearTimeout(timer); }
+  }
+  async syncWithBudget(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}, deadline = performance.now() + 2000) {
+    await this.waitWithinBudget(this.sync(options), deadline);
     return this.status();
   }
   private async drain() {
