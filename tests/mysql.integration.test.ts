@@ -18,9 +18,16 @@ test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotenc
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: createHandler(store, [
     { ...actorA, token: tokenA }, { ...actorB, token: tokenB },
   ]) });
-  const a = new LocalClient(':memory:', { url: server.url.toString(), token: tokenA, agent: 'a' });
-  const b = new LocalClient(':memory:', { url: server.url.toString(), token: tokenB, agent: 'b' });
+  const a = new LocalClient(':memory:', { url: server.url.toString(), token: tokenA, namespace, agent: 'a' });
+  const b = new LocalClient(':memory:', { url: server.url.toString(), token: tokenB, namespace, agent: 'b' });
   try {
+    let attempts = 0;
+    await db.transaction(async conn => {
+      await conn.run('INSERT INTO mb_scopes(namespace,project) VALUES(?,?)', [namespace, 'retry-proof']);
+      if (++attempts < 3) throw Object.assign(new Error('synthetic lock failure'), { errno: attempts === 1 ? 1213 : 1205 });
+    });
+    expect(attempts).toBe(3);
+    expect(await db.rows('SELECT project FROM mb_scopes WHERE namespace=? AND project=?', [namespace, 'retry-proof'])).toHaveLength(1);
     const shared = await a.remember({ project: 'shared', title: '真实 HTTP', body: '真实云端共享知识', kind: 'discovery', sources: ['test:synthetic-http'] });
     expect(shared.syncStatus).toBe('synced');
     expect((await b.search({ project: 'shared', query: '云端共享', limit: 10 })).results[0].id).toBe(shared.memory!.id);
@@ -29,6 +36,14 @@ test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotenc
     expect((await store.put(actorA, original)).version).toBe(1);
     expect((await store.put(actorA, original)).version).toBe(1);
     expect((await store.search(actorB, { project: 'shared', query: '腾讯云', limit: 10 }))[0].id).toBe(memory.id);
+    const concurrent = await Promise.all(Array.from({ length: 8 }, (_, i) => store.put({ ...actorA, projects: ['new-scope'] }, {
+      operationId: crypto.randomUUID(), expectedVersion: 0,
+      memory: createMemory({ project: 'new-scope', title: 'new scope', body: 'concurrent ' + i, kind: 'discovery', sources: ['test:concurrency'] }),
+    })));
+    expect(concurrent).toHaveLength(8);
+    const escaped = createMemory({ project: 'shared', title: 'kind', body: 'line\n"quoted" 中文', kind: 'discovery', sources: ['test:escaping'] });
+    await store.put(actorA, { operationId: crypto.randomUUID(), memory: escaped, expectedVersion: 0 });
+    for (const query of ['"quoted"', 'line\n', 'kind']) expect((await store.search(actorB, { project: 'shared', query, limit: 10 }))[0].id).toBe(escaped.id);
     expect(await store.get({ ...actorB, namespace: namespace.toUpperCase() }, 'shared', [memory.id])).toEqual([]);
     const writes = await Promise.allSettled([
       store.put(actorA, { operationId: crypto.randomUUID(), memory: { ...memory, body: 'A 修改' }, expectedVersion: 1 }),

@@ -9,10 +9,10 @@
 ```sql
 CREATE DATABASE membridge CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 CREATE USER 'membridge'@'127.0.0.1' IDENTIFIED BY 'REPLACE_WITH_STRONG_PASSWORD';
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON membridge.* TO 'membridge'@'127.0.0.1';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER ON membridge.* TO 'membridge'@'127.0.0.1';
 ```
 
-服务首次启动自动创建 mb_scopes、mb_memories、mb_operations。需要 CREATE；建表后可撤销 CREATE，表已存在时仍需验证启动权限。不用 root 作为应用连接。密码中的 @、:、/ 等要 URL 编码。
+服务首次启动自动创建 mb_scopes、mb_memories、mb_operations，并补 search_title/search_body 生成列。迁移需要 ALTER；完成后可撤销 ALTER。保留 CREATE 供启动执行 CREATE TABLE IF NOT EXISTS。不用 root 作为应用连接。密码中的 @、:、/ 等要 URL 编码。
 
 ## 2. 配置服务与 agent
 
@@ -26,6 +26,8 @@ openssl rand -hex 32
 ```
 
 编辑 .env 的 MYSQL_URL；服务端与客户端配置分开管理。agent-tokens.json 替换全部 token，占位值不能用于运行。共同 namespace/project 表示共享，令牌彼此不同。例：codex-main 可访问 shared-project/personal，claude-research 只能访问 shared-project。
+
+每个 (namespace, agent) 必须唯一。access 可设 ro（只读）或 rw（读写删除），省略为 rw。服务端推荐使用 tokenSha256 存令牌 UTF-8 原文的 SHA-256 小写十六进制值；与 token 二选一。客户端仍持有原文。可以通过安全输入生成哈希，勿把原文写入 shell 命令历史。
 
 容器用户 UID/GID 1000。配置文件只读挂载，并确保组 1000 可读：
 

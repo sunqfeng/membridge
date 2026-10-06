@@ -1,12 +1,14 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { AppError, type Principal, projectSchema, putSchema, searchSchema, getSchema, timelineSchema, forgetSchema } from './model';
 import { MemoryStore } from './store';
+import { VERSION } from './version';
+import { diagnostic } from './diagnostics';
 
 export const tokenSchema = z.array(z.object({
-  token: z.string().min(32).max(256), namespace: projectSchema, agent: projectSchema,
-  projects: z.array(projectSchema).min(1),
-}).strict()).min(1);
+  token: z.string().min(32).max(256).optional(), tokenSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(), namespace: projectSchema, agent: projectSchema,
+  projects: z.array(projectSchema).min(1), access: z.enum(['ro','rw']).optional(),
+}).strict().refine(item => Boolean(item.token) !== Boolean(item.tokenSha256), 'Specify exactly one token or tokenSha256')).min(1);
 export type TokenConfig = z.infer<typeof tokenSchema>;
 
 export function createHandler(store: MemoryStore, tokens: TokenConfig) {
@@ -15,12 +17,13 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
   return async (request: Request) => {
     try {
       const url = new URL(request.url);
-      if (request.method === 'GET' && url.pathname === '/health') return response({ status: 'ok', service: 'membridge', version: '0.1.0' });
+      if (request.method === 'GET' && url.pathname === '/health') return response({ status: 'ok', service: 'membridge', version: VERSION });
       if (request.method !== 'POST') throw new AppError('METHOD_NOT_ALLOWED', 405);
       const supplied = request.headers.get('authorization')?.replace(/^Bearer /, '') ?? '';
       const matched = tokens.find(item => {
-        const left = Buffer.from(item.token), right = Buffer.from(supplied);
-        return left.length === right.length && timingSafeEqual(left, right);
+        const left = Buffer.from(item.tokenSha256 ?? createHash('sha256').update(item.token!).digest('hex'), 'hex');
+        const right = createHash('sha256').update(supplied).digest();
+        return timingSafeEqual(left, right);
       });
       if (!matched) throw new AppError('UNAUTHORIZED', 401);
       const actor: Principal = matched;
@@ -46,6 +49,7 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
       try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
       catch { throw new AppError('INVALID_JSON'); }
       switch (url.pathname) {
+        case '/v1/identity': return response({ namespace: actor.namespace, agent: actor.agent });
         case '/v1/put': return response(await store.put(actor, putSchema.parse(input)));
         case '/v1/search': return response(await store.search(actor, searchSchema.parse(input)));
         case '/v1/get': { const args = getSchema.parse(input); return response(await store.get(actor, args.project, args.ids)); }
@@ -56,7 +60,7 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
     } catch (error) {
       if (error instanceof z.ZodError) return response({ error: { code: 'INVALID_INPUT' } }, 400);
       if (error instanceof AppError) return response({ error: { code: error.code } }, error.status);
-      console.error('membridge: request failed (details withheld)');
+      diagnostic('membridge request failed', error);
       return response({ error: { code: 'INTERNAL_ERROR' } }, 500);
     }
   };

@@ -6,7 +6,7 @@ export const draftSchema = z.object({
   title: z.string().trim().min(1).max(240), body: z.string().trim().min(1).max(16000),
   kind: z.enum(['decision', 'discovery', 'bugfix', 'summary', 'preference']),
   sources: z.array(z.string().trim().min(1).max(1000)).min(1).max(20),
-  evidenceDate: z.iso.date().optional(), expiresAt: z.iso.datetime().nullable().optional(),
+  evidenceDate: z.iso.date().optional(), expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
 }).strict();
 export const memoryInputSchema = draftSchema.extend({ id: z.uuid() });
 export const putSchema = z.object({ operationId: z.uuid(), memory: memoryInputSchema, expectedVersion: z.number().int().min(0) }).strict();
@@ -17,7 +17,7 @@ export const forgetSchema = z.object({ operationId: z.uuid(), project: projectSc
 export type MemoryInput = z.infer<typeof memoryInputSchema>;
 export type Memory = MemoryInput & { version: number; agent: string; createdAt: number; updatedAt: number };
 export type IndexEntry = Omit<Memory, 'body' | 'sources'>;
-export type Principal = { namespace: string; agent: string; projects: string[] };
+export type Principal = { namespace: string; agent: string; projects: string[]; access?: 'ro' | 'rw' };
 export type Put = z.infer<typeof putSchema>;
 export type Forget = z.infer<typeof forgetSchema>;
 export type Search = z.infer<typeof searchSchema>;
@@ -27,6 +27,10 @@ export class AppError extends Error {
 export function authorize(actor: Principal, project: string) {
   if (!actor.projects.includes(project)) throw new AppError('FORBIDDEN', 403);
 }
+export function authorizeWrite(actor: Principal, project: string) {
+  authorize(actor, project);
+  if (actor.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
+}
 
 // Adapted from Claude-Mem src/utils/redaction.ts at 2d68c355 (Apache-2.0).
 // Always on in MemBridge; private blocks are excluded before any local write.
@@ -34,9 +38,12 @@ export function redact(value: string): string {
   return value
     .replace(/<private\b[^>]*>[\s\S]*?(?:<\/private\s*>|$)/gi, '[private_omitted]')
     .replace(/-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g, '[redacted]')
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s@]*@/gi, '$1[redacted]@')
+    .replace(/\bAKID[A-Za-z0-9]{16,}\b/g, '[redacted]')
+    .replace(/(["']?authorization["']?\s*[:=]\s*["']?)(?:Bearer|Basic)\s+[^\s"',;}]+/gi, '$1[redacted]')
     .replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[oprs]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|cmem_[A-Za-z0-9_-]{32,}|cm_pro_[A-Za-z0-9_-]{8,})\b/g, '[redacted]')
     .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]')
-    .replace(/((?:["']?)(?:password|passwd|api[_-]?key|secret|access[_-]?token|authorization)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[redacted]');
+    .replace(/((?:["']?)(?:password|passwd|api[_-]?key|secret(?:[_-]?key)?|private[_-]?key|(?:access[_-]?)?token|authorization)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[redacted]');
 }
 export function createMemory(input: z.input<typeof draftSchema>): MemoryInput {
   const parsed = draftSchema.parse(input);
