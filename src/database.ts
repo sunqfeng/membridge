@@ -14,7 +14,7 @@ export interface SqlDatabase extends SqlConnection {
 export const schema = [
   `CREATE TABLE IF NOT EXISTS mb_scopes (namespace VARCHAR(80) NOT NULL, project VARCHAR(80) NOT NULL, PRIMARY KEY(namespace, project))`,
   `CREATE TABLE IF NOT EXISTS mb_memories (namespace VARCHAR(80) NOT NULL, project VARCHAR(80) NOT NULL, id VARCHAR(36) NOT NULL, version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL, payload MEDIUMTEXT NOT NULL, PRIMARY KEY(namespace, project, id))`,
-  `CREATE TABLE IF NOT EXISTS mb_operations (namespace VARCHAR(80) NOT NULL, agent VARCHAR(80) NOT NULL, id VARCHAR(36) NOT NULL, request_hash VARCHAR(64) NOT NULL, result MEDIUMTEXT NOT NULL, PRIMARY KEY(namespace, agent, id))`,
+  `CREATE TABLE IF NOT EXISTS mb_operations (namespace VARCHAR(80) NOT NULL, agent VARCHAR(80) NOT NULL, id VARCHAR(36) NOT NULL, project VARCHAR(80) NOT NULL, memory_id VARCHAR(36) NOT NULL, request_hash VARCHAR(64) NOT NULL, result MEDIUMTEXT NOT NULL, PRIMARY KEY(namespace, agent, id))`,
 ];
 
 export function sqliteDatabase(path: string): SqlDatabase {
@@ -52,7 +52,9 @@ function mysqlConnection(connection: Pool | PoolConnection): SqlConnection {
 export async function mysqlDatabase(url: string): Promise<SqlDatabase> {
   const pool = mysql.createPool({ uri: url, connectionLimit: 5, charset: 'utf8mb4', supportBigNumbers: true });
   const connection = mysqlConnection(pool);
-  try { for (const sql of schema) await connection.run(sql); }
+  try {
+    for (const sql of schema) await connection.run(sql.replace(/VARCHAR\((80|36)\)/g, 'VARCHAR($1) CHARACTER SET ascii COLLATE ascii_bin') + ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin');
+  }
   catch (error) { await pool.end(); throw error; }
   return {
     ...connection, dialect: 'mysql',

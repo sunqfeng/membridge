@@ -6,6 +6,7 @@ import { MemoryStore } from './store';
 async function main() {
   if (!process.env.MYSQL_URL || !process.env.MEMBRIDGE_TOKENS_FILE) throw new Error('MYSQL_URL and MEMBRIDGE_TOKENS_FILE are required');
   const tokens = tokenSchema.parse(JSON.parse(readFileSync(process.env.MEMBRIDGE_TOKENS_FILE, 'utf8')));
+  if (tokens.some(item => item.token.includes('REPLACE_'))) throw new Error('Replace placeholder tokens');
   if (new Set(tokens.map(item => item.token)).size !== tokens.length) throw new Error('Duplicate agent token');
   const port = Number(process.env.PORT ?? '8787');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');

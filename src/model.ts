@@ -32,11 +32,11 @@ export function authorize(actor: Principal, project: string) {
 // Always on in MemBridge; private blocks are excluded before any local write.
 export function redact(value: string): string {
   return value
-    .replace(/<private\b[^>]*>[\s\S]*?(?:<\/private\s*>|$)/gi, '[private omitted]')
-    .replace(/-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g, '[secret omitted]')
-    .replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[oprs]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|cmem_[A-Za-z0-9_-]{32,}|cm_pro_[A-Za-z0-9_-]{8,})\b/g, '[secret omitted]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[secret omitted]')
-    .replace(/((?:["']?)(?:password|passwd|api[_-]?key|secret|access[_-]?token|authorization)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[secret omitted]');
+    .replace(/<private\b[^>]*>[\s\S]*?(?:<\/private\s*>|$)/gi, '[private_omitted]')
+    .replace(/-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g, '[redacted]')
+    .replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[oprs]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|cmem_[A-Za-z0-9_-]{32,}|cm_pro_[A-Za-z0-9_-]{8,})\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]')
+    .replace(/((?:["']?)(?:password|passwd|api[_-]?key|secret|access[_-]?token|authorization)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[redacted]');
 }
 export function createMemory(input: z.input<typeof draftSchema>): MemoryInput {
   const parsed = draftSchema.parse(input);

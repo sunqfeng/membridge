@@ -9,7 +9,7 @@ export class MemoryStore {
     await conn.run(`${insert} INTO mb_scopes(namespace, project) VALUES (?, ?)`, [actor.namespace, project]);
     await conn.rows(`SELECT project FROM mb_scopes WHERE namespace=? AND project=?${this.db.dialect === 'mysql' ? ' FOR UPDATE' : ''}`, [actor.namespace, project]);
   }
-  private async operation<T>(actor: Principal, project: string, operationId: string, request: unknown, apply: (conn: SqlConnection) => Promise<T>): Promise<T> {
+  private async operation<T>(actor: Principal, project: string, memoryId: string, operationId: string, request: unknown, apply: (conn: SqlConnection) => Promise<T>): Promise<T> {
     authorize(actor, project);
     const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
     return this.db.transaction(async conn => {
@@ -22,13 +22,13 @@ export class MemoryStore {
         return result as T;
       }
       const result = await apply(conn);
-      await conn.run('INSERT INTO mb_operations(namespace, agent, id, request_hash, result) VALUES (?, ?, ?, ?, ?)', [actor.namespace, actor.agent, operationId, hash, JSON.stringify(result)]);
+      await conn.run('INSERT INTO mb_operations(namespace, agent, id, project, memory_id, request_hash, result) VALUES (?, ?, ?, ?, ?, ?, ?)', [actor.namespace, actor.agent, operationId, project, memoryId, hash, JSON.stringify(result)]);
       return result;
     });
   }
   async put(actor: Principal, request: Put): Promise<Memory> {
     const draft = createMemory(request.memory);
-    return this.operation(actor, draft.project, request.operationId, { ...request, memory: draft }, async conn => {
+    return this.operation(actor, draft.project, draft.id, request.operationId, { ...request, memory: draft }, async conn => {
       const old = (await conn.rows('SELECT version, deleted, payload FROM mb_memories WHERE namespace=? AND project=? AND id=?', [actor.namespace, draft.project, draft.id]))[0];
       if ((old ? Number(old.version) : 0) !== request.expectedVersion || old?.deleted === 1) throw new AppError('VERSION_CONFLICT', 409);
       const now = Date.now();
@@ -39,17 +39,13 @@ export class MemoryStore {
     });
   }
   async forget(actor: Principal, request: Forget): Promise<{ id: string; version: number; deleted: true }> {
-    return this.operation(actor, request.project, request.operationId, request, async conn => {
+    return this.operation(actor, request.project, request.id, request.operationId, request, async conn => {
       const row = (await conn.rows('SELECT version, deleted FROM mb_memories WHERE namespace=? AND project=? AND id=?', [actor.namespace, request.project, request.id]))[0];
       if (!row || Number(row.version) !== request.expectedVersion || Number(row.deleted) === 1) throw new AppError('VERSION_CONFLICT', 409);
       const version = request.expectedVersion + 1;
       await conn.run("UPDATE mb_memories SET version=?, deleted=1, updated_at=?, payload='{}' WHERE namespace=? AND project=? AND id=?", [version, Date.now(), actor.namespace, request.project, request.id]);
       // Operation receipts keep only IDs/versions, never deleted text.
-      const ops = await conn.rows('SELECT agent, id, result FROM mb_operations WHERE namespace=?', [actor.namespace]);
-      for (const op of ops) {
-        const saved = JSON.parse(String(op.result)) as { id?: string; project?: string; version?: number };
-        if (saved.id === request.id && saved.project === request.project) await conn.run('UPDATE mb_operations SET result=? WHERE namespace=? AND agent=? AND id=?', [JSON.stringify({ id: request.id, version, deleted: true }), actor.namespace, String(op.agent), String(op.id)]);
-      }
+      await conn.run('UPDATE mb_operations SET result=? WHERE namespace=? AND project=? AND memory_id=?', [JSON.stringify({ id: request.id, version, deleted: true }), actor.namespace, request.project, request.id]);
       return { id: request.id, version, deleted: true };
     });
   }
