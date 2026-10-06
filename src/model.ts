@@ -1,0 +1,51 @@
+import { z } from 'zod';
+
+export const projectSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/);
+export const draftSchema = z.object({
+  id: z.uuid().optional(), project: projectSchema,
+  title: z.string().trim().min(1).max(240), body: z.string().trim().min(1).max(16000),
+  kind: z.enum(['decision', 'discovery', 'bugfix', 'summary', 'preference']),
+  sources: z.array(z.string().trim().min(1).max(1000)).min(1).max(20),
+  evidenceDate: z.iso.date().optional(), expiresAt: z.iso.datetime().nullable().optional(),
+}).strict();
+export const memoryInputSchema = draftSchema.extend({ id: z.uuid() });
+export const putSchema = z.object({ operationId: z.uuid(), memory: memoryInputSchema, expectedVersion: z.number().int().min(0) }).strict();
+export const searchSchema = z.object({ project: projectSchema, query: z.string().trim().min(1).max(200), limit: z.number().int().min(1).max(30).default(10) }).strict();
+export const getSchema = z.object({ project: projectSchema, ids: z.array(z.uuid()).min(1).max(20) }).strict();
+export const timelineSchema = z.object({ project: projectSchema, anchor: z.uuid(), depth: z.number().int().min(1).max(10).default(3) }).strict();
+export const forgetSchema = z.object({ operationId: z.uuid(), project: projectSchema, id: z.uuid(), expectedVersion: z.number().int().min(1) }).strict();
+export type MemoryInput = z.infer<typeof memoryInputSchema>;
+export type Memory = MemoryInput & { version: number; agent: string; createdAt: number; updatedAt: number };
+export type IndexEntry = Omit<Memory, 'body' | 'sources'>;
+export type Principal = { namespace: string; agent: string; projects: string[] };
+export type Put = z.infer<typeof putSchema>;
+export type Forget = z.infer<typeof forgetSchema>;
+export type Search = z.infer<typeof searchSchema>;
+export class AppError extends Error {
+  constructor(public code: string, public status = 400) { super(code); }
+}
+export function authorize(actor: Principal, project: string) {
+  if (!actor.projects.includes(project)) throw new AppError('FORBIDDEN', 403);
+}
+
+// Adapted from Claude-Mem src/utils/redaction.ts at 2d68c355 (Apache-2.0).
+// Always on in MemBridge; private blocks are excluded before any local write.
+export function redact(value: string): string {
+  return value
+    .replace(/<private\b[^>]*>[\s\S]*?(?:<\/private\s*>|$)/gi, '[private omitted]')
+    .replace(/-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/g, '[secret omitted]')
+    .replace(/\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|gh[oprs]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|cmem_[A-Za-z0-9_-]{32,}|cm_pro_[A-Za-z0-9_-]{8,})\b/g, '[secret omitted]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[secret omitted]')
+    .replace(/((?:["']?)(?:password|passwd|api[_-]?key|secret|access[_-]?token|authorization)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[secret omitted]');
+}
+export function createMemory(input: z.input<typeof draftSchema>): MemoryInput {
+  const parsed = draftSchema.parse(input);
+  return { ...parsed, id: parsed.id ?? crypto.randomUUID(), title: redact(parsed.title), body: redact(parsed.body), sources: parsed.sources.map(redact) };
+}
+export function index(memory: Memory): IndexEntry {
+  const { body, sources, ...entry } = memory;
+  return entry;
+}
+export function active(memory: Memory, now = Date.now()): boolean {
+  return !memory.expiresAt || Date.parse(memory.expiresAt) > now;
+}

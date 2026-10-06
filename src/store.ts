@@ -1,0 +1,77 @@
+import { createHash } from 'node:crypto';
+import { type SqlDatabase, type SqlConnection } from './database';
+import { AppError, active, authorize, createMemory, index, type Principal, type Memory, type Put, type Forget, type Search } from './model';
+
+export class MemoryStore {
+  constructor(private db: SqlDatabase) {}
+  private async scopeLock(conn: SqlConnection, actor: Principal, project: string) {
+    const insert = this.db.dialect === 'mysql' ? 'INSERT IGNORE' : 'INSERT OR IGNORE';
+    await conn.run(`${insert} INTO mb_scopes(namespace, project) VALUES (?, ?)`, [actor.namespace, project]);
+    await conn.rows(`SELECT project FROM mb_scopes WHERE namespace=? AND project=?${this.db.dialect === 'mysql' ? ' FOR UPDATE' : ''}`, [actor.namespace, project]);
+  }
+  private async operation<T>(actor: Principal, project: string, operationId: string, request: unknown, apply: (conn: SqlConnection) => Promise<T>): Promise<T> {
+    authorize(actor, project);
+    const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
+    return this.db.transaction(async conn => {
+      await this.scopeLock(conn, actor, project);
+      const old = await conn.rows('SELECT request_hash, result FROM mb_operations WHERE namespace=? AND agent=? AND id=?', [actor.namespace, actor.agent, operationId]);
+      if (old[0]) {
+        if (old[0].request_hash !== hash) throw new AppError('IDEMPOTENCY_CONFLICT', 409);
+        const result = JSON.parse(String(old[0].result));
+        if (result.deleted && typeof request === 'object' && request !== null && 'memory' in request) throw new AppError('MEMORY_DELETED', 410);
+        return result as T;
+      }
+      const result = await apply(conn);
+      await conn.run('INSERT INTO mb_operations(namespace, agent, id, request_hash, result) VALUES (?, ?, ?, ?, ?)', [actor.namespace, actor.agent, operationId, hash, JSON.stringify(result)]);
+      return result;
+    });
+  }
+  async put(actor: Principal, request: Put): Promise<Memory> {
+    const draft = createMemory(request.memory);
+    return this.operation(actor, draft.project, request.operationId, { ...request, memory: draft }, async conn => {
+      const old = (await conn.rows('SELECT version, deleted, payload FROM mb_memories WHERE namespace=? AND project=? AND id=?', [actor.namespace, draft.project, draft.id]))[0];
+      if ((old ? Number(old.version) : 0) !== request.expectedVersion || old?.deleted === 1) throw new AppError('VERSION_CONFLICT', 409);
+      const now = Date.now();
+      const memory: Memory = { ...draft, agent: actor.agent, version: request.expectedVersion + 1, createdAt: old ? (JSON.parse(String(old.payload)) as Memory).createdAt : now, updatedAt: now };
+      if (old) await conn.run('UPDATE mb_memories SET version=?, updated_at=?, payload=? WHERE namespace=? AND project=? AND id=?', [memory.version, now, JSON.stringify(memory), actor.namespace, draft.project, draft.id]);
+      else await conn.run('INSERT INTO mb_memories(namespace, project, id, version, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?)', [actor.namespace, draft.project, draft.id, memory.version, now, JSON.stringify(memory)]);
+      return memory;
+    });
+  }
+  async forget(actor: Principal, request: Forget): Promise<{ id: string; version: number; deleted: true }> {
+    return this.operation(actor, request.project, request.operationId, request, async conn => {
+      const row = (await conn.rows('SELECT version, deleted FROM mb_memories WHERE namespace=? AND project=? AND id=?', [actor.namespace, request.project, request.id]))[0];
+      if (!row || Number(row.version) !== request.expectedVersion || Number(row.deleted) === 1) throw new AppError('VERSION_CONFLICT', 409);
+      const version = request.expectedVersion + 1;
+      await conn.run("UPDATE mb_memories SET version=?, deleted=1, updated_at=?, payload='{}' WHERE namespace=? AND project=? AND id=?", [version, Date.now(), actor.namespace, request.project, request.id]);
+      // Operation receipts keep only IDs/versions, never deleted text.
+      const ops = await conn.rows('SELECT agent, id, result FROM mb_operations WHERE namespace=?', [actor.namespace]);
+      for (const op of ops) {
+        const saved = JSON.parse(String(op.result)) as { id?: string; project?: string; version?: number };
+        if (saved.id === request.id && saved.project === request.project) await conn.run('UPDATE mb_operations SET result=? WHERE namespace=? AND agent=? AND id=?', [JSON.stringify({ id: request.id, version, deleted: true }), actor.namespace, String(op.agent), String(op.id)]);
+      }
+      return { id: request.id, version, deleted: true };
+    });
+  }
+  async get(actor: Principal, project: string, ids: string[]): Promise<Memory[]> {
+    authorize(actor, project);
+    const rows = await this.db.rows(`SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND id IN (${ids.map(() => '?').join(',')})`, [actor.namespace, project, ...ids]);
+    return rows.map(row => JSON.parse(String(row.payload)) as Memory).filter(memory => active(memory));
+  }
+  async search(actor: Principal, request: Search) {
+    authorize(actor, request.project);
+    const query = request.query.toLocaleLowerCase();
+    // Parameterized substring match preserves CJK partial queries. Scan bounded candidates.
+    const escaped = query.replace(/[!%_]/g, character => '!' + character);
+    const rows = await this.db.rows("SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND LOWER(payload) LIKE ? ESCAPE '!' ORDER BY updated_at DESC, id DESC LIMIT 300", [actor.namespace, request.project, '%' + escaped + '%']);
+    return rows.map(row => JSON.parse(String(row.payload)) as Memory).filter(memory => active(memory) && (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query)).slice(0, request.limit).map(index);
+  }
+  async timeline(actor: Principal, project: string, anchor: string, depth: number) {
+    const memory = (await this.get(actor, project, [anchor]))[0];
+    if (!memory) return [];
+    const before = await this.db.rows('SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND (updated_at<? OR (updated_at=? AND id<?)) ORDER BY updated_at DESC, id DESC LIMIT ' + depth, [actor.namespace, project, memory.updatedAt, memory.updatedAt, anchor]);
+    const after = await this.db.rows('SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND (updated_at>? OR (updated_at=? AND id>?)) ORDER BY updated_at, id LIMIT ' + depth, [actor.namespace, project, memory.updatedAt, memory.updatedAt, anchor]);
+    return [...before.reverse().map(row => JSON.parse(String(row.payload)) as Memory), memory, ...after.map(row => JSON.parse(String(row.payload)) as Memory)].filter(item => active(item)).map(index);
+  }
+  close() { return this.db.close(); }
+}
