@@ -32,6 +32,7 @@ export function sqliteDatabase(path: string): SqlDatabase {
   schema.forEach(sql => db.run(sql));
   sqliteSearchColumns(db);
   db.run('CREATE INDEX IF NOT EXISTS mb_memories_recent ON mb_memories(namespace,project,deleted,updated_at,id)');
+  db.run('CREATE INDEX IF NOT EXISTS mb_operations_memory ON mb_operations(namespace,project,memory_id)');
   const connection: SqlConnection = {
     rows: async (sql, args = []) => db.query(sql).all(...args) as Row[],
     run: async (sql, args = []) => { db.query(sql).run(...args); },
@@ -74,6 +75,11 @@ export async function mysqlDatabase(url: string): Promise<SqlDatabase> {
     const indexes = await connection.rows("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='mb_memories' AND INDEX_NAME='mb_memories_recent'");
     if (!indexes.length) {
       try { await connection.run('CREATE INDEX mb_memories_recent ON mb_memories(namespace,project,deleted,updated_at,id)'); }
+      catch (error) { if ((error as { errno?: number }).errno !== 1061) throw error; }
+    }
+    const receipts = await connection.rows("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='mb_operations' AND INDEX_NAME='mb_operations_memory'");
+    if (!receipts.length) {
+      try { await connection.run('CREATE INDEX mb_operations_memory ON mb_operations(namespace,project,memory_id)'); }
       catch (error) { if ((error as { errno?: number }).errno !== 1061) throw error; }
     }
   }

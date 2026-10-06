@@ -8,6 +8,7 @@ type Options = { url?: string; token?: string; namespace?: string; agent: string
 type QueueRow = { operation_id: string; project: string; memory_id: string; kind: 'put' | 'forget'; payload: string; status: string };
 type Cached = { payload: string; fetched_at: number; pending: number };
 type SearchReply = { results: IndexEntry[]; source: 'local' | 'cloud'; cloudStatus: 'fresh' | 'not_checked' | 'unavailable' | 'not_configured'; freshness: 'fresh' | 'stale'; pendingIds: string[] };
+type ClientStatus = { configured: boolean; namespace: string | null; access: 'ro' | 'rw' | 'unknown'; pending: number; conflicts: number; blocked: number; operations: { project: string; memory_id: string; status: string; kind: string }[] };
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 
 export class LocalClient {
@@ -21,6 +22,9 @@ export class LocalClient {
   private verified = false;
   private verifying?: Promise<void>;
   private identityFailure?: { error: AppError; until: number };
+  private closedStatus?: ClientStatus;
+  private syncBackoffUntil = 0;
+  private requests = new Set<AbortController>();
   private currentNamespace: string;
   private namespaceBound: boolean;
   private access: 'ro' | 'rw' | 'unknown' = 'unknown';
@@ -77,6 +81,7 @@ export class LocalClient {
   }
   private async bindIdentity() {
     const identity = identitySchema.parse(await this.call<unknown>('identity', {}));
+    if (this.closedStatus) throw new AppError('CLIENT_CLOSED', 503);
     if ((this.namespaceBound && identity.namespace !== this.currentNamespace) || identity.agent !== this.options.agent) throw new AppError('CLOUD_IDENTITY_MISMATCH', 403);
     this.db.transaction(() => {
       if (identity.namespace !== this.currentNamespace) {
@@ -102,25 +107,29 @@ export class LocalClient {
     this.db.run('DELETE FROM snapshots WHERE rowid NOT IN (SELECT rowid FROM snapshots ORDER BY fetched_at DESC LIMIT 500)');
   }
   private async call<T>(path: string, payload: unknown): Promise<T> {
+    if (this.closedStatus) throw new AppError('CLIENT_CLOSED', 503);
     if (!this.configured()) throw new AppError('CLOUD_NOT_CONFIGURED', 503);
-    let response: Response;
+    const controller = new AbortController();
+    this.requests.add(controller);
     try {
-      response = await this.requestFetch(this.options.url!.replace(/\/$/, '') + '/v1/' + path, {
-        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
-        headers: { authorization: 'Bearer ' + this.options.token, 'content-type': 'application/json' }, body: JSON.stringify(payload),
-      });
-    } catch { throw new AppError('CLOUD_UNAVAILABLE', 503); }
-    if (!response.ok) {
-      const body = await response.json().catch(() => null) as { error?: { code?: string } } | null;
-      throw new AppError(body?.error?.code ?? 'CLOUD_ERROR', response.status);
-    }
-    return response.json() as Promise<T>;
+      let response: Response;
+      try {
+        response = await this.requestFetch(this.options.url!.replace(/\/$/, '') + '/v1/' + path, {
+          method: 'POST', redirect: 'error', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
+          headers: { authorization: 'Bearer ' + this.options.token, 'content-type': 'application/json' }, body: JSON.stringify(payload),
+        });
+      } catch { throw new AppError('CLOUD_UNAVAILABLE', 503); }
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: { code?: string } } | null;
+        throw new AppError(body?.error?.code ?? 'CLOUD_ERROR', response.status);
+      }
+      return await response.json() as T;
+    } finally { this.requests.delete(controller); }
   }
   private local(project: string, id: string) { return this.db.query('SELECT payload,fetched_at,pending FROM cache WHERE project=? AND id=?').get(project, id) as Cached | null; }
   private cachedPut(memory: Memory, pending: boolean) {
     this.db.query('INSERT INTO cache(project,id,payload,fetched_at,pending) VALUES(?,?,?,?,?) ON CONFLICT(project,id) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at,pending=excluded.pending WHERE cache.pending=0 OR excluded.pending=1')
       .run(memory.project, memory.id, JSON.stringify(memory), this.now(), Number(pending));
-    this.prune();
   }
   private clearSnapshots(project: string) { this.db.query('DELETE FROM snapshots WHERE project=?').run(project); }
   private unresolved(project: string, id: string) { return !!this.db.query('SELECT operation_id FROM outbox WHERE project=? AND memory_id=? LIMIT 1').get(project, id); }
@@ -137,8 +146,9 @@ export class LocalClient {
       this.cachedPut(memory, true);
       this.db.query('INSERT INTO outbox(operation_id,project,memory_id,kind,payload) VALUES(?,?,?,?,?)').run(operation.operationId, draft.project, draft.id, 'put', JSON.stringify(operation));
       this.clearSnapshots(draft.project);
+      this.prune();
     })();
-    await this.sync({ retryIdentity: false });
+    await this.syncWithBudget({ retryIdentity: false });
     const row = this.local(draft.project, draft.id);
     return { memory: row ? JSON.parse(row.payload) as Memory : null, syncStatus: this.syncStatus(draft.project, draft.id), access: this.access };
   }
@@ -155,12 +165,13 @@ export class LocalClient {
       this.clearSnapshots(project);
       this.db.query('INSERT INTO outbox(operation_id,project,memory_id,kind,payload) VALUES(?,?,?,?,?)').run(operation.operationId, project, id, 'forget', JSON.stringify(operation));
     })();
-    await this.sync({ retryIdentity: false });
+    await this.syncWithBudget({ retryIdentity: false });
     return { id, syncStatus: this.syncStatus(project, id) };
   }
   sync(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}): Promise<ReturnType<LocalClient['status']>> {
+    if (this.closedStatus) return Promise.resolve(this.closedStatus);
     // Explicit sync can probe recovery immediately; automatic writes share backoff.
-    if (options.retryIdentity !== false) this.identityFailure = undefined;
+    if (options.retryIdentity !== false) { this.identityFailure = undefined; this.syncBackoffUntil = 0; }
     this.syncRequested = true;
     this.retryFailedRequested ||= options.retryFailed ?? false;
     if (this.syncing) return this.syncing;
@@ -172,53 +183,79 @@ export class LocalClient {
           this.retryFailedRequested = false; this.verified = false; this.identityFailure = undefined;
         }
         await this.drain();
-      } while (this.syncRequested);
+      } while (this.syncRequested && !this.closedStatus);
       return this.status();
     })().finally(() => { this.syncing = undefined; });
     return this.syncing;
   }
+  async syncWithBudget(options: { retryFailed?: boolean; retryIdentity?: boolean } = {}) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.sync(options), new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); })]);
+    } finally { clearTimeout(timer); }
+    return this.status();
+  }
   private async drain() {
-    if (!this.configured()) return this.status();
-    let rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
-    if (!rows.length && !this.verified) {
-      try { await this.verifyIdentity(); }
-      catch (error) { if (!(error instanceof AppError)) throw error; return this.status(); }
-      rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
+    if (!this.configured() || this.closedStatus || this.now() < this.syncBackoffUntil) return this.status();
+    try {
+      await this.verifyIdentity();
+      if (this.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
+      if (this.access === 'unknown') throw new AppError('SERVER_ACCESS_UNAVAILABLE', 503);
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      if (!this.closedStatus && [401, 403].includes(error.status)) this.db.run("UPDATE outbox SET status='blocked' WHERE status='pending'");
+      return this.status();
     }
-    for (const row of rows) {
-      try {
-        await this.verifyIdentity();
-        if (this.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
-        if (this.access === 'unknown') throw new AppError('SERVER_ACCESS_UNAVAILABLE', 503);
-        const result = await this.call<Memory | { deleted: true }>(row.kind, JSON.parse(row.payload));
-        this.db.transaction(() => {
-          this.db.query('DELETE FROM outbox WHERE operation_id=?').run(row.operation_id);
-          this.db.query('DELETE FROM cache WHERE project=? AND id=?').run(row.project, row.memory_id);
-          if (row.kind === 'put' && !('deleted' in result)) this.cachedPut(result, false);
-          this.clearSnapshots(row.project);
-        })();
-      } catch (error) {
-        if (!(error instanceof AppError)) throw error;
-        if (error.status === 410) {
+    const rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
+    // Legacy queues can contain duplicate IDs: never schedule those concurrently.
+    const seen = new Set<string>();
+    const queue = rows.filter(row => { const key = JSON.stringify([row.project, row.memory_id]); if (seen.has(key)) return false; seen.add(key); return true; });
+    let next = 0, stopped = false;
+    const worker = async () => {
+      while (!stopped && !this.closedStatus && next < queue.length) {
+        const row = queue[next++];
+        // A foreground discard/rebase may have removed this operation meanwhile.
+        if (!this.db.query("SELECT 1 FROM outbox WHERE operation_id=? AND status='pending'").get(row.operation_id)) continue;
+        try {
+          const result = await this.call<Memory | { deleted: true }>(row.kind, JSON.parse(row.payload));
+          if (this.closedStatus) return;
           this.db.transaction(() => {
+            if (!this.db.query("SELECT 1 FROM outbox WHERE operation_id=? AND status='pending'").get(row.operation_id)) return;
             this.db.query('DELETE FROM outbox WHERE operation_id=?').run(row.operation_id);
             this.db.query('DELETE FROM cache WHERE project=? AND id=?').run(row.project, row.memory_id);
+            if (row.kind === 'put' && !('deleted' in result)) this.cachedPut(result, false);
             this.clearSnapshots(row.project);
           })();
-        } else if (error.status === 409) {
-          this.db.query("UPDATE outbox SET status='conflict' WHERE operation_id=?").run(row.operation_id);
-        } else if (error.status === 401 || error.status === 403) {
-          this.db.query("UPDATE outbox SET status='blocked' WHERE operation_id=?").run(row.operation_id);
-        } else if (error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status)) {
-          this.db.query("UPDATE outbox SET status='rejected' WHERE operation_id=?").run(row.operation_id);
-        } else break;
+        } catch (error) {
+          if (this.closedStatus) return;
+          if (!(error instanceof AppError)) { stopped = true; throw error; }
+          if (error.status === 410) {
+            this.db.transaction(() => {
+              if (!this.db.query("SELECT 1 FROM outbox WHERE operation_id=? AND status='pending'").get(row.operation_id)) return;
+              this.db.query('DELETE FROM outbox WHERE operation_id=?').run(row.operation_id);
+              this.db.query('DELETE FROM cache WHERE project=? AND id=?').run(row.project, row.memory_id);
+              this.clearSnapshots(row.project);
+            })();
+          } else if (error.status === 409) {
+            this.db.query("UPDATE outbox SET status='conflict' WHERE operation_id=?").run(row.operation_id);
+          } else if (error.status === 401 || error.status === 403) {
+            this.db.query("UPDATE outbox SET status='blocked' WHERE operation_id=?").run(row.operation_id);
+            stopped = true;
+          } else if (error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status)) {
+            this.db.query("UPDATE outbox SET status='rejected' WHERE operation_id=?").run(row.operation_id);
+          } else { stopped = true; this.syncBackoffUntil = this.now() + 5000; }
+        }
       }
-    }
+    };
+    // No awaits inside SQLite transactions: worker completions write back serially.
+    const settled = await Promise.allSettled(Array.from({ length: Math.min(4, queue.length) }, () => worker()));
+    if (!this.closedStatus) this.prune();
+    for (const result of settled) if (result.status === 'rejected') throw result.reason;
     return this.status();
   }
   private overlays(project: string) {
-    const rows = this.db.query('SELECT * FROM outbox WHERE project=?').all(project) as QueueRow[];
-    const pending = rows.filter(row => row.kind === 'put').map(row => this.local(project, row.memory_id)).filter((row): row is Cached => !!row).map(row => JSON.parse(row.payload) as Memory);
+    const rows = this.db.query('SELECT o.memory_id,o.kind,c.payload FROM outbox o LEFT JOIN cache c ON c.project=o.project AND c.id=o.memory_id WHERE o.project=?').all(project) as { memory_id: string; kind: string; payload: string | null }[];
+    const pending = rows.filter(row => row.kind === 'put' && row.payload !== null).map(row => JSON.parse(row.payload!) as Memory);
     return { pending, hidden: new Set(rows.map(row => row.memory_id)), pendingIds: rows.map(row => row.memory_id) };
   }
   private offline(error: unknown) {
@@ -238,7 +275,7 @@ export class LocalClient {
     let source: SearchReply['source'] = 'local';
     let cloudStatus: SearchReply['cloudStatus'] = 'not_checked';
     let fresh = !!snapshot && this.now() - snapshot.fetched_at < this.ttlMs;
-    if (refresh || !fresh || results.length === 0) {
+    if (refresh || !fresh) {
       try {
         await this.verifyIdentity();
         results = await this.call<IndexEntry[]>(path, request);
@@ -272,8 +309,9 @@ export class LocalClient {
     let cloudStatus = 'not_checked';
     for (const id of ids) {
       const row = this.local(project, id);
-      if (overlay.hidden.has(id)) { if (row && active(JSON.parse(row.payload) as Memory, this.now())) results.push(JSON.parse(row.payload)); continue; }
-      if (row && !refresh && this.now() - row.fetched_at < this.ttlMs && active(JSON.parse(row.payload) as Memory, this.now())) results.push(JSON.parse(row.payload));
+      const memory = row ? JSON.parse(row.payload) as Memory : null;
+      if (overlay.hidden.has(id)) { if (memory && active(memory, this.now())) results.push(memory); continue; }
+      if (row && memory && !refresh && this.now() - row.fetched_at < this.ttlMs && active(memory, this.now())) results.push(memory);
       else needed.push(id);
     }
     if (needed.length) {
@@ -283,7 +321,7 @@ export class LocalClient {
         this.db.transaction(() => {
           needed.forEach(id => this.db.query('DELETE FROM cache WHERE project=? AND id=? AND pending=0').run(project, id));
           remote.forEach(memory => this.cachedPut(memory, false));
-          this.clearSnapshots(project);
+          this.prune();
         })();
         results.push(...remote); cloudStatus = 'fresh';
       } catch (error) {
@@ -326,8 +364,9 @@ export class LocalClient {
       this.db.query("UPDATE outbox SET operation_id=?,payload=?,status='pending' WHERE operation_id=?").run(operation.operationId, JSON.stringify(operation), row.operation_id);
       this.cachedPut({ ...localMemory, version: cloudMemory.version, createdAt: cloudMemory.createdAt, updatedAt: this.now() }, true);
       this.clearSnapshots(project);
+      this.prune();
     })();
-    await this.sync();
+    await this.syncWithBudget();
     return { localMemory: JSON.parse(this.local(project, id)?.payload ?? JSON.stringify(localMemory)) as Memory, cloudMemory, expectedVersion: cloudMemory.version, requiresConfirmation: false, syncStatus: this.syncStatus(project, id) };
   }
   discardPending(project: string, id: string) {
@@ -339,9 +378,15 @@ export class LocalClient {
     })();
     return this.status();
   }
-  status() {
+  status(): ClientStatus {
+    if (this.closedStatus) return this.closedStatus;
     const rows = this.db.query('SELECT project,memory_id,status,kind FROM outbox ORDER BY seq').all() as { project: string; memory_id: string; status: string; kind: string }[];
     return { configured: this.configured(), namespace: this.namespaceBound || !this.configured() ? this.currentNamespace : null, access: this.access, pending: rows.filter(row => row.status === 'pending').length, conflicts: rows.filter(row => row.status === 'conflict').length, blocked: rows.filter(row => ['blocked', 'rejected'].includes(row.status)).length, operations: rows };
   }
-  close() { this.db.close(); }
+  close() {
+    if (this.closedStatus) return;
+    this.closedStatus = this.status();
+    for (const controller of this.requests) controller.abort();
+    this.db.close();
+  }
 }

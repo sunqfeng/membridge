@@ -1,4 +1,4 @@
-import { test, expect } from 'bun:test';
+import { test, expect, spyOn } from 'bun:test';
 import { mysqlDatabase, schema } from '../src/database';
 import mysql from 'mysql2/promise';
 import { createHash } from 'node:crypto';
@@ -12,6 +12,31 @@ if (url && !new URL(url).pathname.slice(1).startsWith('membridge_test')) throw n
 
 const adminUrl = process.env.MEMBRIDGE_TEST_MYSQL_ADMIN_URL;
 if (adminUrl && !new URL(adminUrl).pathname.slice(1).startsWith('membridge_test')) throw new Error('Migration grant tests require a dedicated membridge_test* admin database');
+test.skipIf(!url)('real MySQL expiry compares milliseconds and timezone offsets before projecting indexes', async () => {
+  const db = await mysqlDatabase(url!), store = new MemoryStore(db);
+  const actor = { namespace: 'expiry-' + crypto.randomUUID(), agent: 'a', projects: ['demo'] };
+  const clock = spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-06T12:00:00.123Z'));
+  try {
+    const cases = ['2026-10-06T12:00:00.123Z', '2026-10-06T20:00:00.123+08:00', '2026-10-06T07:00:00.123-05:00', '2026-10-06T12:00:00.1239Z', '2026-10-06T12:00:00.124Z', '2026-10-06T20:00:00.124+08:00', '2026-10-06T07:00:00.124-05:00', '2026-10-06T12:00:00.2Z', '2026-10-06T12:01:00Z', null];
+    const all: string[] = [], visible: string[] = [];
+    for (const expiresAt of cases) {
+      const memory = createMemory({ project: 'demo', title: 'expiry', body: 'expiry evidence', kind: 'decision', sources: ['test:expiry'], expiresAt });
+      all.push(memory.id); if (!expiresAt || Date.parse(expiresAt) > Date.now()) visible.push(memory.id);
+      await store.put(actor, { operationId: crypto.randomUUID(), memory, expectedVersion: 0 });
+    }
+    expect((await store.get(actor, 'demo', all)).map(item => item.id).sort()).toEqual(visible.slice().sort());
+    const recent = await store.recent(actor, { project: 'demo', limit: 30 });
+    expect(recent.map(item => item.id).sort()).toEqual(visible.slice().sort()); expect(recent.every(item => !('body' in item) && !('sources' in item))).toBe(true);
+    expect((await store.search(actor, { project: 'demo', query: 'expiry', limit: 30 })).map(item => item.id).sort()).toEqual(visible.slice().sort());
+    expect((await store.timeline(actor, 'demo', visible[0], 10)).map(item => item.id).sort()).toEqual(visible.slice().sort());
+  } finally {
+    clock.mockRestore();
+    await db.run('DELETE FROM mb_operations WHERE namespace=?', [actor.namespace]);
+    await db.run('DELETE FROM mb_memories WHERE namespace=?', [actor.namespace]);
+    await db.run('DELETE FROM mb_scopes WHERE namespace=?', [actor.namespace]);
+    await store.close();
+  }
+});
 test.skipIf(!adminUrl)('real MySQL migration needs ALTER and INDEX; restricted app account works after revoking both', async () => {
   const suffix = crypto.randomUUID().replaceAll('-', '');
   const database = 'membridge_test_grants_' + suffix, user = 'mb_' + suffix.slice(0, 20), password = crypto.randomUUID();
@@ -75,6 +100,8 @@ test.skipIf(!url)('real MySQL: shared Chinese memory, concurrent CAS, idempotenc
   try {
     const orderIndex = await db.rows("SHOW INDEX FROM mb_memories WHERE Key_name='mb_memories_recent'");
     expect(orderIndex.map(row => row.Column_name)).toEqual(['namespace', 'project', 'deleted', 'updated_at', 'id']);
+    const receiptIndex = await db.rows("SHOW INDEX FROM mb_operations WHERE Key_name='mb_operations_memory'");
+    expect(receiptIndex.map(row => row.Column_name)).toEqual(['namespace', 'project', 'memory_id']);
     expect((await store.put(actorA, fixturePut)).body).toBe(fixture.body);
     expect((await b.recent({ project: 'shared', kind: 'decision', limit: 10 })).results[0].id).toBe(fixture.id);
     let attempts = 0;

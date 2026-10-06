@@ -1,6 +1,6 @@
 {
   "name": "membridge",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Local-first shared memory for agents, backed by your own MySQL cloud.",
   "type": "module",

@@ -12,6 +12,7 @@ export const tokenSchema = z.array(z.object({
 export type TokenConfig = z.infer<typeof tokenSchema>;
 
 export function createHandler(store: MemoryStore, tokens: TokenConfig) {
+  const credentials = tokens.map(({ token, tokenSha256, ...actor }) => ({ actor, hash: tokenSha256 ? Buffer.from(tokenSha256, 'hex') : createHash('sha256').update(token!).digest() }));
   const limits = new Map<string, { start: number; count: number }>();
   const response = (body: unknown, status = 200) => Response.json(body, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
   return async (request: Request) => {
@@ -20,11 +21,8 @@ export function createHandler(store: MemoryStore, tokens: TokenConfig) {
       if (request.method === 'GET' && url.pathname === '/health') return response({ status: 'ok', service: 'membridge', version: VERSION });
       if (request.method !== 'POST') throw new AppError('METHOD_NOT_ALLOWED', 405);
       const supplied = request.headers.get('authorization')?.replace(/^Bearer /, '') ?? '';
-      const matched = tokens.find(item => {
-        const left = Buffer.from(item.tokenSha256 ?? createHash('sha256').update(item.token!).digest('hex'), 'hex');
-        const right = createHash('sha256').update(supplied).digest();
-        return timingSafeEqual(left, right);
-      });
+      const suppliedHash = createHash('sha256').update(supplied).digest();
+      const matched = credentials.find(item => timingSafeEqual(item.hash, suppliedHash))?.actor;
       if (!matched) throw new AppError('UNAUTHORIZED', 401);
       const actor: Principal = matched;
       const key = actor.namespace + ':' + actor.agent;
