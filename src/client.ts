@@ -1,12 +1,14 @@
 import { Database } from 'bun:sqlite';
+import { createHash, randomBytes } from 'node:crypto';
 import { cacheIdentity, legacyIdentity, secureCache } from './cache';
-import { AppError, active, createMemory, index, type Memory, type IndexEntry, type Search, type Recent, type Put, type Forget, type draftSchema } from './model';
+import { AppError, active, createMemory, index, identitySchema, type Memory, type IndexEntry, type Search, type Recent, type Put, type Forget, type draftSchema } from './model';
 import type { z } from 'zod';
 
 type Options = { url?: string; token?: string; namespace?: string; agent: string; migrateLegacy?: boolean; ttlMs?: number; fetch?: typeof fetch; now?: () => number };
 type QueueRow = { operation_id: string; project: string; memory_id: string; kind: 'put' | 'forget'; payload: string; status: string };
 type Cached = { payload: string; fetched_at: number; pending: number };
 type SearchReply = { results: IndexEntry[]; source: 'local' | 'cloud'; cloudStatus: 'fresh' | 'not_checked' | 'unavailable' | 'not_configured'; freshness: 'fresh' | 'stale'; pendingIds: string[] };
+const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 
 export class LocalClient {
   private db: Database;
@@ -17,6 +19,9 @@ export class LocalClient {
   private syncRequested = false;
   private retryFailedRequested = false;
   private verified = false;
+  private currentNamespace: string;
+  private namespaceBound: boolean;
+  private access: 'ro' | 'rw' | 'unknown' = 'unknown';
   constructor(path: string, private options: Options) {
     secureCache(path);
     this.db = new Database(path);
@@ -26,7 +31,12 @@ export class LocalClient {
     this.db.run('CREATE TABLE IF NOT EXISTS cache (project TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL, pending INTEGER NOT NULL, PRIMARY KEY(project,id))');
     this.db.run('CREATE TABLE IF NOT EXISTS snapshots (project TEXT NOT NULL, key TEXT NOT NULL, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL, PRIMARY KEY(project,key))');
     this.db.run('CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE, project TEXT NOT NULL, memory_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'pending\')');
-    const identity = cacheIdentity(options.url, options.namespace ?? 'owner', options.agent);
+    this.db.run('CREATE TABLE IF NOT EXISTS rebase_previews (operation_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, cloud_hash TEXT NOT NULL, local_hash TEXT NOT NULL, expires_at INTEGER NOT NULL)');
+    this.db.run('CREATE TABLE IF NOT EXISTS cloud_identity (id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, access TEXT)');
+    const binding = this.db.query('SELECT namespace,access FROM cloud_identity WHERE id=1').get() as { namespace: string; access: 'ro' | 'rw' | null } | null;
+    this.currentNamespace = options.namespace ?? binding?.namespace ?? 'owner';
+    this.namespaceBound = options.namespace !== undefined || Boolean(binding);
+    const identity = cacheIdentity(options.url, this.currentNamespace, options.agent);
     const previous = this.db.query('SELECT identity FROM profile WHERE id=1').get() as { identity: string } | null;
     const oldIdentity = legacyIdentity(options.url, options.token, options.agent);
     if (previous && previous.identity !== identity && previous.identity !== oldIdentity && !options.migrateLegacy) { this.db.close(); throw new AppError('CACHE_IDENTITY_MISMATCH_USE_EXPLICIT_LEGACY_IMPORT'); }
@@ -37,9 +47,12 @@ export class LocalClient {
     if (credential?.fingerprint !== oldIdentity) {
       // Keep unsent work, but never serve synced data cached under previous credentials.
       this.db.run('DELETE FROM cache WHERE pending=0'); this.db.run('DELETE FROM snapshots');
+      this.db.run('DELETE FROM rebase_previews'); this.db.run('UPDATE cloud_identity SET access=NULL');
       this.db.run("UPDATE outbox SET status='pending' WHERE status='blocked'");
       this.db.query('INSERT INTO credentials(id,fingerprint) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint').run(oldIdentity);
     }
+    if (credential?.fingerprint === oldIdentity && binding?.access) this.access = binding.access;
+    if (options.url && !this.namespaceBound) { this.db.run('DELETE FROM cache WHERE pending=0'); this.db.run('DELETE FROM snapshots'); }
     secureCache(path);
     this.ttlMs = options.ttlMs ?? 60000;
     if (!Number.isFinite(this.ttlMs) || this.ttlMs < 0 || this.ttlMs > 3600000) { this.db.close(); throw new AppError('INVALID_CACHE_TTL'); }
@@ -49,9 +62,23 @@ export class LocalClient {
   private configured() { return !!this.options.url && !!this.options.token; }
   private async verifyIdentity() {
     if (this.verified || !this.configured()) return;
-    const identity = await this.call<{ namespace: string; agent: string }>('identity', {});
-    if (identity.namespace !== (this.options.namespace ?? 'owner') || identity.agent !== this.options.agent) throw new AppError('CLOUD_IDENTITY_MISMATCH', 403);
+    const identity = identitySchema.parse(await this.call<unknown>('identity', {}));
+    if ((this.namespaceBound && identity.namespace !== this.currentNamespace) || identity.agent !== this.options.agent) throw new AppError('CLOUD_IDENTITY_MISMATCH', 403);
+    this.db.transaction(() => {
+      if (identity.namespace !== this.currentNamespace) {
+        this.db.run('DELETE FROM cache WHERE pending=0'); this.db.run('DELETE FROM snapshots');
+        this.db.run("UPDATE outbox SET status='pending' WHERE status='blocked'");
+      }
+      this.db.query('UPDATE profile SET identity=? WHERE id=1').run(cacheIdentity(this.options.url, identity.namespace, this.options.agent));
+      this.db.query('INSERT OR REPLACE INTO cloud_identity VALUES(1,?,?)').run(identity.namespace, identity.access ?? null);
+    })();
+    this.currentNamespace = identity.namespace; this.namespaceBound = true; this.access = identity.access ?? 'unknown';
     this.verified = true;
+  }
+  private async checkWritable() {
+    try { await this.verifyIdentity(); } catch (error) { this.offline(error); }
+    if (this.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
+    if (this.configured() && this.verified && this.access === 'unknown') throw new AppError('SERVER_ACCESS_UNAVAILABLE', 503);
   }
   private prune() {
     this.db.query('DELETE FROM cache WHERE pending=0 AND fetched_at<?').run(this.now() - 30 * 86400000);
@@ -84,6 +111,7 @@ export class LocalClient {
   private unresolved(project: string, id: string) { return !!this.db.query('SELECT operation_id FROM outbox WHERE project=? AND memory_id=? LIMIT 1').get(project, id); }
   async remember(input: z.input<typeof draftSchema>, expectedVersion = 0) {
     const draft = createMemory(input);
+    await this.checkWritable();
     if (this.unresolved(draft.project, draft.id)) throw new AppError('PENDING_WRITE_EXISTS', 409);
     if (!Number.isInteger(expectedVersion) || expectedVersion < 0) throw new AppError('INVALID_VERSION');
     const old = this.local(draft.project, draft.id);
@@ -97,13 +125,14 @@ export class LocalClient {
     })();
     await this.sync();
     const row = this.local(draft.project, draft.id);
-    return { memory: row ? JSON.parse(row.payload) as Memory : null, syncStatus: this.syncStatus(draft.project, draft.id) };
+    return { memory: row ? JSON.parse(row.payload) as Memory : null, syncStatus: this.syncStatus(draft.project, draft.id), access: this.access };
   }
   private syncStatus(project: string, id: string) {
     const row = this.db.query('SELECT status FROM outbox WHERE project=? AND memory_id=?').get(project, id) as { status: string } | null;
     return row?.status ?? 'synced';
   }
   async forget(project: string, id: string, expectedVersion: number) {
+    await this.checkWritable();
     if (this.unresolved(project, id)) throw new AppError('PENDING_WRITE_EXISTS', 409);
     const operation: Forget = { operationId: crypto.randomUUID(), project, id, expectedVersion };
     this.db.transaction(() => {
@@ -133,10 +162,17 @@ export class LocalClient {
   }
   private async drain() {
     if (!this.configured()) return this.status();
-    const rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
+    let rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
+    if (!rows.length && !this.verified) {
+      try { await this.verifyIdentity(); }
+      catch (error) { if (!(error instanceof AppError)) throw error; return this.status(); }
+      rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
+    }
     for (const row of rows) {
       try {
         await this.verifyIdentity();
+        if (this.access === 'ro') throw new AppError('READ_ONLY_CREDENTIAL', 403);
+        if (this.access === 'unknown') throw new AppError('SERVER_ACCESS_UNAVAILABLE', 503);
         const result = await this.call<Memory | { deleted: true }>(row.kind, JSON.parse(row.payload));
         this.db.transaction(() => {
           this.db.query('DELETE FROM outbox WHERE operation_id=?').run(row.operation_id);
@@ -245,21 +281,31 @@ export class LocalClient {
     await this.verifyIdentity();
     return { results: await this.call<IndexEntry[]>('timeline', { project, anchor, depth }), source: 'cloud' };
   }
-  async rebasePending(project: string, id: string, confirmVersion?: number) {
+  async rebasePending(project: string, id: string, confirmVersion?: number, confirmToken?: string) {
+    if ((confirmVersion === undefined) !== (confirmToken === undefined)) throw new AppError('PREVIEW_CONFIRMATION_REQUIRED');
     const row = this.db.query("SELECT * FROM outbox WHERE project=? AND memory_id=? AND kind='put' AND status='conflict'").get(project, id) as QueueRow | null;
     const cached = this.local(project, id);
     if (!row || !cached) throw new AppError('CONFLICTED_PUT_REQUIRED', 409);
     const localMemory = JSON.parse(cached.payload) as Memory;
+    const preview = this.db.query('SELECT * FROM rebase_previews WHERE operation_id=?').get(row.operation_id) as { token_hash: string; cloud_hash: string; local_hash: string; expires_at: number } | null;
+    if (confirmToken !== undefined && (!preview || preview.token_hash !== digest(confirmToken) || preview.expires_at < this.now() || preview.local_hash !== digest(row.payload))) throw new AppError('INVALID_OR_EXPIRED_CONFIRM_TOKEN', 409);
     await this.verifyIdentity();
     // Bypass get()'s local overlay: review the actual cloud revision.
     const cloudMemory = (await this.call<Memory[]>('get', { project, ids: [id] }))[0];
     if (!cloudMemory) throw new AppError('CLOUD_MEMORY_NOT_FOUND_OR_EXPIRED', 404);
-    if (confirmVersion === undefined) return { localMemory, cloudMemory, expectedVersion: cloudMemory.version, requiresConfirmation: true };
-    if (confirmVersion !== cloudMemory.version) throw new AppError('CLOUD_VERSION_CHANGED', 409);
+    if (confirmVersion === undefined) {
+      const token = randomBytes(32).toString('hex');
+      this.db.query('DELETE FROM rebase_previews WHERE expires_at<? OR operation_id NOT IN (SELECT operation_id FROM outbox)').run(this.now());
+      this.db.query('INSERT OR REPLACE INTO rebase_previews VALUES(?,?,?,?,?)').run(row.operation_id, digest(token), digest(JSON.stringify(cloudMemory)), digest(row.payload), this.now() + 600000);
+      return { localMemory, cloudMemory, expectedVersion: cloudMemory.version, confirmToken: token, requiresConfirmation: true };
+    }
+    if (confirmVersion !== cloudMemory.version || preview!.cloud_hash !== digest(JSON.stringify(cloudMemory))) throw new AppError('CLOUD_VERSION_CHANGED', 409);
+    await this.checkWritable();
     const operation = { ...JSON.parse(row.payload) as Put, expectedVersion: cloudMemory.version, operationId: crypto.randomUUID() };
     this.db.transaction(() => {
       const current = this.db.query('SELECT status FROM outbox WHERE operation_id=?').get(row.operation_id) as { status: string } | null;
       if (current?.status !== 'conflict') throw new AppError('PENDING_OPERATION_CHANGED', 409);
+      this.db.query('DELETE FROM rebase_previews WHERE operation_id=?').run(row.operation_id);
       this.db.query("UPDATE outbox SET operation_id=?,payload=?,status='pending' WHERE operation_id=?").run(operation.operationId, JSON.stringify(operation), row.operation_id);
       this.cachedPut({ ...localMemory, version: cloudMemory.version, createdAt: cloudMemory.createdAt, updatedAt: this.now() }, true);
       this.clearSnapshots(project);
@@ -269,6 +315,7 @@ export class LocalClient {
   }
   discardPending(project: string, id: string) {
     this.db.transaction(() => {
+      this.db.query('DELETE FROM rebase_previews WHERE operation_id IN (SELECT operation_id FROM outbox WHERE project=? AND memory_id=?)').run(project, id);
       this.db.query('DELETE FROM outbox WHERE project=? AND memory_id=?').run(project, id);
       this.db.query('DELETE FROM cache WHERE project=? AND id=?').run(project, id);
       this.clearSnapshots(project);
@@ -277,7 +324,7 @@ export class LocalClient {
   }
   status() {
     const rows = this.db.query('SELECT project,memory_id,status,kind FROM outbox ORDER BY seq').all() as { project: string; memory_id: string; status: string; kind: string }[];
-    return { configured: this.configured(), pending: rows.filter(row => row.status === 'pending').length, conflicts: rows.filter(row => row.status === 'conflict').length, blocked: rows.filter(row => ['blocked', 'rejected'].includes(row.status)).length, operations: rows };
+    return { configured: this.configured(), namespace: this.namespaceBound || !this.configured() ? this.currentNamespace : null, access: this.access, pending: rows.filter(row => row.status === 'pending').length, conflicts: rows.filter(row => row.status === 'conflict').length, blocked: rows.filter(row => ['blocked', 'rejected'].includes(row.status)).length, operations: rows };
   }
   close() { this.db.close(); }
 }

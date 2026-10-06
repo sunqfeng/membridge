@@ -31,6 +31,7 @@ export function sqliteDatabase(path: string): SqlDatabase {
   db.run('PRAGMA journal_mode=WAL');
   schema.forEach(sql => db.run(sql));
   sqliteSearchColumns(db);
+  db.run('CREATE INDEX IF NOT EXISTS mb_memories_recent ON mb_memories(namespace,project,deleted,updated_at,id)');
   const connection: SqlConnection = {
     rows: async (sql, args = []) => db.query(sql).all(...args) as Row[],
     run: async (sql, args = []) => { db.query(sql).run(...args); },
@@ -69,6 +70,11 @@ export async function mysqlDatabase(url: string): Promise<SqlDatabase> {
         try { await connection.run(`ALTER TABLE mb_memories ADD COLUMN ${name} MEDIUMTEXT GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.${field}'))) VIRTUAL`); }
         catch (error) { if ((error as { errno?: number }).errno !== 1060) throw error; }
       }
+    }
+    const indexes = await connection.rows("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='mb_memories' AND INDEX_NAME='mb_memories_recent'");
+    if (!indexes.length) {
+      try { await connection.run('CREATE INDEX mb_memories_recent ON mb_memories(namespace,project,deleted,updated_at,id)'); }
+      catch (error) { if ((error as { errno?: number }).errno !== 1061) throw error; }
     }
   }
   catch (error) { await pool.end(); throw error; }

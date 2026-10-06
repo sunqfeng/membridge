@@ -4,6 +4,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { createHandler } from '../src/http';
+import { MemoryStore } from '../src/store';
+import { sqliteDatabase } from '../src/database';
 
 test.each(['mcp.ts', 'cli.ts'])('real stdio %s subprocess responds without corrupting MCP stdout', async entry => {
   const dir = mkdtempSync(join(tmpdir(), 'membridge-stdio-'));
@@ -22,4 +25,21 @@ test.each(['mcp.ts', 'cli.ts'])('real stdio %s subprocess responds without corru
     if (!resolve(dir).startsWith(resolve(tmpdir()) + '/') && !resolve(dir).startsWith(resolve(tmpdir()) + '\\')) throw new Error('Unsafe cleanup path');
     rmSync(dir, { recursive: true, force: true });
   }
+}, 15000);
+
+test('real MCP runtime discovers team namespace and blocks read-only writes before queueing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'membridge-auto-stdio-')), token = 'r'.repeat(40);
+  const store = new MemoryStore(sqliteDatabase(':memory:'));
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: createHandler(store, [{ token, namespace: 'team', agent: 'auto-test', projects: ['demo'], access: 'ro' }]) });
+  const client = new Client({ name: 'auto-test', version: '1' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve(import.meta.dir, '../src/cli.ts'), 'mcp'],
+    env: { MEMBRIDGE_URL: server.url.toString(), MEMBRIDGE_TOKEN: token, MEMBRIDGE_AGENT: 'auto-test', MEMBRIDGE_CACHE_PATH: join(dir, 'private', 'cache.db') }, stderr: 'pipe' });
+  try {
+    await client.connect(transport);
+    const saved = await client.callTool({ name: 'remember', arguments: { project: 'demo', title: 'readonly', body: 'must not queue', kind: 'decision', sources: ['test:source'] } });
+    expect(JSON.parse((saved.content as { text: string }[])[0].text).error).toBe('READ_ONLY_CREDENTIAL');
+    const status = await client.callTool({ name: 'status', arguments: {} });
+    const report = JSON.parse((status.content as { text: string }[])[0].text);
+    expect(report.namespace).toBe('team'); expect(report.access).toBe('ro'); expect(report.operations).toEqual([]);
+  } finally { await client.close(); await server.stop(true); await store.close(); rmSync(dir, { recursive: true, force: true }); }
 }, 15000);

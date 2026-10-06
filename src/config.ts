@@ -12,9 +12,9 @@ export function clientConfig(env: Environment = process.env) {
     if (token!.length < 32 || token!.length > 256) throw new AppError('INVALID_TOKEN_LENGTH');
   }
   const agent = projectSchema.safeParse(env.MEMBRIDGE_AGENT ?? 'local-agent');
-  const namespace = projectSchema.safeParse(env.MEMBRIDGE_NAMESPACE ?? 'owner');
-  if (!agent.success || !namespace.success) throw new AppError('INVALID_AGENT_OR_NAMESPACE');
+  const namespace = env.MEMBRIDGE_NAMESPACE === undefined ? undefined : projectSchema.safeParse(env.MEMBRIDGE_NAMESPACE);
+  if (!agent.success || namespace?.success === false) throw new AppError('INVALID_AGENT_OR_NAMESPACE');
   const ttlMs = Number(env.MEMBRIDGE_CACHE_TTL_MS ?? '60000');
   if (!Number.isFinite(ttlMs) || ttlMs < 0 || ttlMs > 3600000) throw new AppError('INVALID_CACHE_TTL');
-  return { url, token, agent: agent.data, namespace: namespace.data, ttlMs };
+  return { url, token, agent: agent.data, namespace: namespace?.data ?? (url ? undefined : 'owner'), ttlMs };
 }

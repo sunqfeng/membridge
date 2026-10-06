@@ -4,7 +4,7 @@
 
 推荐先运行 `bun run doctor`（等价于 `bun src/cli.ts doctor`）。它读取当前 MEMBRIDGE_* 环境变量，检查 URL、授权连通、namespace/agent、缓存身份和 Unix 权限，输出可复制的 Codex TOML/通用 MCP JSON，自动填入本机 Bun 和 CLI 绝对路径。未指定 namespace/agent 时从令牌身份推导，已指定但不匹配则失败；失败退出码 1。
 
-输出不含令牌：启动 Codex/其他 MCP 客户端的环境必须提供 MEMBRIDGE_TOKEN；若使用客户端私有配置保存令牌，则仅在本机加入 env.MEMBRIDGE_TOKEN。合并已有 MCP 配置，不覆盖其他服务。doctor 只读诊断，不导入旧缓存、同步或改权限；权限错误需修正专用缓存目录后重跑。Windows ACL 需在本机确认。没有 URL/token 是本地模式，会明确说明尚不可共享。
+输出不含令牌：启动 Codex/其他 MCP 客户端的环境必须提供 MEMBRIDGE_TOKEN；若使用客户端私有配置保存令牌，则仅在本机加入 env.MEMBRIDGE_TOKEN。合并已有 MCP 配置，不覆盖其他服务。doctor 区分 DNS/TLS/超时/拒绝连接，并从 /health 比对版本、从 /v1/identity 展示 ro/rw。它只读诊断，不导入缓存、同步或改权限。Windows ACL 需在本机确认。没有 URL/token 是本地模式，会明确说明尚不可共享。
 
 ## Codex
 
@@ -52,8 +52,10 @@ Linux 改为实际绝对路径；Bun 不在客户端 PATH 时 command 用可执�
 
 工具发现中应有 search、remember、get_memories、sync、status。让 A 在 shared-project 写一条有来源的测试发现并检查 synced；让 B 查询同项目关键词并读详情。若工具缺失、状态 pending 或 cloudStatus=unavailable，不能声称已跨 agent 共享。
 
-缓存默认 `~/.membridge/<身份散列>.db`，绑定 URL/namespace/agent，与 token 无关，默认 60 秒 TTL。namespace 必须与服务端一致（默认 owner），客户端上传前检查云端身份。轮换 token 保留 outbox，并清除旧凭据下的已同步缓存。0.1.0 数据迁移见 [升级说明](upgrade-0.1.1.md)。
+缓存默认 `~/.membridge/<身份散列>.db`，绑定 URL/namespace/agent，与 token 无关，默认 60 秒 TTL。云模式不配置 MEMBRIDGE_NAMESPACE 时首次连接自动获取；显式配置必须与令牌一致。首次自动识别需要联网，之后同凭据可用私有身份提示离线重启；新令牌需联网验证身份后再复用对应缓存。本地模式 namespace 默认 owner。轮换 token 保留同身份 outbox，并清除旧已同步缓存。旧版迁移见 [升级说明](upgrade-0.1.3.md)。
 
-MEMBRIDGE_CACHE_PATH 可指定绝对文件路径，必须放在专用私人目录；Linux 会把该目录设为 700、DB/WAL/SHM 为 600，Windows 依赖用户目录 ACL。缓存未经加密。已同步缓存最多 1000 条/30 天，查询快照最多 500 条/1 天；待同步数据不淘汰。
+MEMBRIDGE_CACHE_PATH 可指定绝对文件路径。新建私人子目录为 700，DB/WAL/SHM 为 600；现有目录不自动 chmod，Unix 上权限过松或不归当前用户所有则拒绝。不要把缓存直接放在共有目录；可指定其中一个新私人子目录。Windows 依赖用户目录 ACL。缓存未经加密。已同步缓存最多 1000 条/30 天，查询快照最多 500 条/1 天；待同步数据不淘汰。
+
+ro 凭据的 remember/forget/确认 rebase 会在改缓存或入队前失败。首次离线尚未验证权限时，本地写入可为 pending，access=unknown，不能声称已共享；已有待同步内容不会因切换为 ro 被丢弃。
 
 personal 只是独立项目名，不自动授予全 agent；只给需要个人偏好的 agent 权限。假设与草稿不能仅因为工具允许写入就自动公开给其他 agent。

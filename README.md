@@ -2,7 +2,7 @@
 
 **让多个 Agent 共用你自己的云记忆。** 本地有效缓存优先，缺失/过期查询云端，研究所得先持久化到本地，再同步。
 
-基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.2 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。0.1.0 安装先读 [缓存升级说明](docs/upgrade-0.1.1.md)，本批改动见 [使用体验升级](docs/usability.md)。
+基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.3 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。已有安装先读 [0.1.3 升级说明](docs/upgrade-0.1.3.md)，使用方式见 [工具说明](docs/usability.md)。
 
 ```mermaid
 flowchart LR
@@ -41,13 +41,13 @@ bun scripts/install-skill.ts codex
 |---|---|
 | search | 有效查询快照优先，再查云端；返回索引 |
 | recent | 无需关键词，按项目/类型查看最近记忆 |
-| get_memories | 批量详情、来源、版本，重分配正文预算；offset/nextOffset 分页 |
+| get_memories | 重分配正文预算；offset/nextOffset 分页，续读绑定 version/bodyHash |
 | timeline | 云端时间线索引 |
 | remember | 本地保存并尝试同步，更新要求当前版本 |
 | forget | 本地隐藏并排队云端删除 |
 | sync / status | 重试 pending；retryFailed=true 重试 blocked/rejected；报告冲突 |
 | discard_pending | 经用户选择丢弃本地操作，不删除云端 |
-| rebase_pending | 预览本地/云端冲突；确认版本后保留本地正文重投 |
+| rebase_pending | 预览本地/云端冲突；凭一次性 confirmToken 和版本确认重投 |
 
 同项目用稳定 slug，例如 investment-research，不用机器路径。同事实更新复用 ID 和 version，独立事实新 ID。来源、证据日期和有效期由 agent 提供。
 
