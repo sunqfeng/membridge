@@ -1,0 +1,8 @@
+.git
+node_modules
+.env*
+data
+*.db*
+agent-tokens.json
+tests
+tmp

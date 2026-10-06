@@ -1,0 +1,4 @@
+[
+  { "token": "REPLACE_WITH_DISTINCT_RANDOM_32_BYTE_TOKEN_A", "namespace": "owner", "agent": "codex-main", "projects": ["shared-project", "personal"] },
+  { "token": "REPLACE_WITH_DISTINCT_RANDOM_32_BYTE_TOKEN_B", "namespace": "owner", "agent": "claude-research", "projects": ["shared-project"] }
+]

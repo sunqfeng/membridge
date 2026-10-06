@@ -1,0 +1,23 @@
+services:
+  membridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MYSQL_URL: ${MYSQL_URL:?Set MYSQL_URL in .env}
+      MEMBRIDGE_TOKENS_FILE: /run/secrets/agent-tokens.json
+      HOST: 127.0.0.1
+      PORT: ${PORT:-8787}
+    volumes:
+      - ../agent-tokens.json:/run/secrets/agent-tokens.json:ro
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:' + process.env.PORT + '/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

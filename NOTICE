@@ -6,3 +6,7 @@ This product includes software developed for the Claude-Mem project.
 Licensed under the Apache License, Version 2.0.
 
 If other attributions are required by dependencies or included code, add them here.
+
+MemBridge modifications, Copyright 2026 MemBridge contributors.
+Modified credential redaction expressions from Claude-Mem src/utils/redaction.ts.
+New cloud MySQL service, local cache/outbox, MCP integration and shared skill.

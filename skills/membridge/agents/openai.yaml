@@ -1,0 +1,4 @@
+interface:
+  display_name: "MemBridge 共享记忆"
+  short_description: "Shared project memory across agents"
+  default_prompt: "使用 $membridge 查询本项目已有知识，再继续当前任务。"

@@ -1,0 +1,11 @@
+import { cpSync, existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { resolve, join } from 'node:path';
+const harness = process.argv[2] ?? 'codex';
+if (!['codex', 'claude'].includes(harness)) throw new Error('Usage: bun scripts/install-skill.ts codex|claude');
+const root = join(homedir(), harness === 'codex' ? '.codex' : '.claude', 'skills');
+const target = join(root, 'membridge');
+if (existsSync(target)) throw new Error('MemBridge skill already exists. Review/update it manually.');
+mkdirSync(root, { recursive: true });
+cpSync(resolve(import.meta.dir, '../skills/membridge'), target, { recursive: true, errorOnExist: true, force: false });
+console.log(`Installed skill: ${target}. Configure MCP separately.`);
