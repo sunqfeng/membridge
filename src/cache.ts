@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, writeFileSync, linkSync, unlinkSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, writeFileSync, linkSync, unlinkSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { AppError } from './model';
 
@@ -29,8 +29,40 @@ export function secureCache(path: string) {
     chmodSync(file, 0o600);
   }
 }
-export function selectCachePath(directory: string, options: { url?: string; token?: string; namespace: string; agent: string; legacyPath?: string }) {
+export function selectCachePath(directory: string, options: { url?: string; token?: string; namespace?: string; agent: string; legacyPath?: string; readOnly?: boolean }) {
+  // Keep a first-offline queue in place after binding. Never copy a live queue:
+  // copying it would leave two writers able to replay divergent local edits.
+  const provisional = join(directory, legacyIdentity(options.url, options.token, options.agent).slice(0, 16) + '.unbound.db');
+  const knownBindings: string[] = [];
+  if (existsSync(directory)) {
+    const candidates = readdirSync(directory).filter(name => (options.namespace === undefined ? /^[a-f0-9]{16}(?:\.unbound)?\.db$/ : /^[a-f0-9]{16}\.unbound\.db$/).test(name)).map(name => join(directory, name));
+    for (const path of [provisional, ...candidates.filter(path => path !== provisional)]) {
+      if (!existsSync(path)) continue;
+      if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) throw new AppError('CACHE_NOT_REGULAR_FILE');
+      if (process.platform !== 'win32' && lstatSync(path).uid !== process.getuid?.()) throw new AppError('CACHE_FILE_NOT_OWNED');
+      if (!options.readOnly) secureCache(path);
+      const previous = new Database(path, { readonly: true });
+      try {
+        const profile = (previous.query("SELECT name FROM sqlite_master WHERE name='profile'").get()
+          && previous.query('SELECT identity FROM profile WHERE id=1').get()) as { identity: string } | null;
+        const binding = (previous.query("SELECT name FROM sqlite_master WHERE name='cloud_identity'").get()
+          && previous.query('SELECT namespace FROM cloud_identity WHERE id=1').get()) as { namespace: string } | null;
+        if (options.namespace === undefined) {
+          if (path === provisional) return path;
+          if (binding && profile?.identity === cacheIdentity(options.url, binding.namespace, options.agent)) knownBindings.push(path);
+          continue;
+        }
+        if (binding?.namespace === options.namespace && profile?.identity === cacheIdentity(options.url, options.namespace, options.agent)) return path;
+        if (path === provisional && !binding && profile?.identity === cacheIdentity(options.url, 'owner', options.agent)) return path;
+      } finally { previous.close(); }
+    }
+  }
+  // During offline token rotation, reuse a uniquely known local scope. This is
+  // an expected identity, never authorization: cloud verification must match it
+  // before any queued writes are sent. Ambiguous scopes stay unbound.
+  if (options.namespace === undefined) return knownBindings.length === 1 ? knownBindings[0] : provisional;
   const target = join(directory, cacheIdentity(options.url, options.namespace, options.agent).slice(0, 16) + '.db');
+  if (options.readOnly) return target;
   let oldPath = options.legacyPath ?? join(directory, legacyIdentity(options.url, options.token, options.agent).slice(0, 16) + '.db');
   // 0.1.1/0.1.2 may have queued work under the default owner placeholder.
   const placeholder = join(directory, cacheIdentity(options.url, 'owner', options.agent).slice(0, 16) + '.db');

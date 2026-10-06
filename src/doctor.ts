@@ -8,7 +8,7 @@ import { AppError, identitySchema } from './model';
 import { VERSION } from './version';
 import { networkError } from './network-error';
 import { clientConfig, type Environment } from './config';
-import { cacheIdentity, legacyIdentity } from './cache';
+import { cacheIdentity, legacyIdentity, selectCachePath } from './cache';
 
 type Check = { code: string; status: 'ok' | 'warning' | 'error'; version?: string };
 type Report = { ok: boolean; checks: Check[]; codexConfig?: string; claudeConfig?: { mcpServers: { membridge: { command: string; args: string[]; env: Record<string, string> } } } };
@@ -41,7 +41,8 @@ export async function doctor(options: { env?: Environment; fetch?: typeof fetch 
             const parsed = z.object({ service: z.literal('membridge'), version: z.string().max(40).regex(/^\d+\.\d+\.\d+$/) }).safeParse(await health.json());
             if (!parsed.success) checks.push({ code: 'INVALID_SERVER_VERSION', status: 'error' });
             else {
-              const remote = parsed.data.version.split('.').map(Number), local = VERSION.split('.').map(Number);
+              // 0.1.4 changes client resilience, not the cloud protocol.
+              const remote = parsed.data.version.split('.').map(Number), local = [0, 1, 3];
               const older = remote[0] < local[0] || remote[0] === local[0] && (remote[1] < local[1] || remote[1] === local[1] && remote[2] < local[2]);
               checks.push({ code: older ? 'SERVER_VERSION_TOO_OLD' : parsed.data.version === VERSION ? 'SERVER_VERSION_MATCHED' : 'SERVER_VERSION_DIFFERENT', status: older ? 'error' : parsed.data.version === VERSION ? 'ok' : 'warning', version: parsed.data.version });
               checks.push({ code: 'CLIENT_VERSION', status: 'ok', version: VERSION });
@@ -52,9 +53,10 @@ export async function doctor(options: { env?: Environment; fetch?: typeof fetch 
     } catch (error) { checks.push({ code: networkError(error), status: 'error' }); }
   } else checks.push({ code: 'LOCAL_ONLY_NOT_SHARED', status: 'warning' });
   const namespace = config.namespace ?? 'owner';
-  const cachePath = env.MEMBRIDGE_CACHE_PATH ?? join(homedir(), '.membridge', cacheIdentity(config.url, namespace, config.agent).slice(0, 16) + '.db');
-  const parent = dirname(resolve(cachePath));
+  let cachePath = env.MEMBRIDGE_CACHE_PATH ?? join(homedir(), '.membridge', cacheIdentity(config.url, namespace, config.agent).slice(0, 16) + '.db');
   try {
+    if (!env.MEMBRIDGE_CACHE_PATH) cachePath = selectCachePath(join(homedir(), '.membridge'), { ...config, readOnly: true });
+    const parent = dirname(resolve(cachePath));
     if (cachePath !== ':memory:') {
       if (existsSync(parent)) {
         const entry = lstatSync(parent);

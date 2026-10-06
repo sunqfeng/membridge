@@ -52,7 +52,11 @@ Linux 改为实际绝对路径；Bun 不在客户端 PATH 时 command 用可执�
 
 工具发现中应有 search、remember、get_memories、sync、status。让 A 在 shared-project 写一条有来源的测试发现并检查 synced；让 B 查询同项目关键词并读详情。若工具缺失、状态 pending 或 cloudStatus=unavailable，不能声称已跨 agent 共享。
 
-缓存默认 `~/.membridge/<身份散列>.db`，绑定 URL/namespace/agent，与 token 无关，默认 60 秒 TTL。云模式不配置 MEMBRIDGE_NAMESPACE 时首次连接自动获取；显式配置必须与令牌一致。首次自动识别需要联网，之后同凭据可用私有身份提示离线重启；新令牌需联网验证身份后再复用对应缓存。本地模式 namespace 默认 owner。轮换 token 保留同身份 outbox，并清除旧已同步缓存。旧版迁移见 [升级说明](upgrade-0.1.3.md)。
+缓存通常位于 `~/.membridge/<身份散列>.db`，绑定 URL/namespace/agent，与 token 无关，默认 60 秒 TTL。云模式不配置 MEMBRIDGE_NAMESPACE 时尝试自动获取；显式配置必须与令牌一致。首次网络失败或身份请求返回 408/425/429/5xx 时仍启动 MCP，未绑定时 status.namespace=null、access=unknown，记忆可本地保存为 pending；联网验证后自动绑定并同步。首次身份请求最多等待 10 秒。
+
+首次离线创建的缓存使用 `<凭据散列>.unbound.db`，绑定后继续使用原文件，联网重启和同身份令牌轮换不会复制或丢弃队列。离线轮换仅在 URL/agent 对应唯一已绑定缓存时复用；存在多个身份时请显式配置 namespace 和缓存路径。云端身份必须与缓存绑定一致才能上传。令牌轮换清除旧已同步缓存，保留 outbox。本地模式 namespace 默认 owner。旧版迁移见 [升级说明](upgrade-0.1.4.md)。
+
+身份验证请求合并并发调用，临时失败后退避 5 秒；remember 不会在同一次写入中重复等待验证超时。启动和每 30 秒后台同步遵守退避，手动 sync 可立即尝试恢复。401/403 不会降级为首次未绑定模式。可恢复云故障与搜索零命中仍分别返回。
 
 MEMBRIDGE_CACHE_PATH 可指定绝对文件路径。新建私人子目录为 700，DB/WAL/SHM 为 600；现有目录不自动 chmod，Unix 上权限过松或不归当前用户所有则拒绝。不要把缓存直接放在共有目录；可指定其中一个新私人子目录。Windows 依赖用户目录 ACL。缓存未经加密。已同步缓存最多 1000 条/30 天，查询快照最多 500 条/1 天；待同步数据不淘汰。
 

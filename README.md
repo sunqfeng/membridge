@@ -2,7 +2,7 @@
 
 **让多个 Agent 共用你自己的云记忆。** 本地有效缓存优先，缺失/过期查询云端，研究所得先持久化到本地，再同步。
 
-基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.3 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。已有安装先读 [0.1.3 升级说明](docs/upgrade-0.1.3.md)，使用方式见 [工具说明](docs/usability.md)。
+基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.4 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。已有安装先读 [0.1.4 升级说明](docs/upgrade-0.1.4.md)，使用方式见 [工具说明](docs/usability.md)。
 
 ```mermaid
 flowchart LR

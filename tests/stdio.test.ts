@@ -43,3 +43,20 @@ test('real MCP runtime discovers team namespace and blocks read-only writes befo
     expect(report.namespace).toBe('team'); expect(report.access).toBe('ro'); expect(report.operations).toEqual([]);
   } finally { await client.close(); await server.stop(true); await store.close(); rmSync(dir, { recursive: true, force: true }); }
 }, 15000);
+
+test.each([429, 503])('real first-start MCP survives identity HTTP %s and serves local memory', async status => {
+  const dir = mkdtempSync(join(tmpdir(), 'membridge-offline-stdio-'));
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({}, { status }) });
+  const client = new Client({ name: 'offline-test', version: '1' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve(import.meta.dir, '../src/cli.ts'), 'mcp'],
+    env: { MEMBRIDGE_URL: server.url.toString(), MEMBRIDGE_TOKEN: 't'.repeat(40), MEMBRIDGE_AGENT: 'offline-test', MEMBRIDGE_CACHE_PATH: join(dir, 'cache.db') }, stderr: 'pipe' });
+  try {
+    await client.connect(transport);
+    const saved = JSON.parse(((await client.callTool({ name: 'remember', arguments: { project: 'demo', title: 'offline', body: 'available locally', kind: 'decision', sources: ['test:source'] } })).content as { text: string }[])[0].text);
+    expect(saved.syncStatus).toBe('pending');
+    const read = JSON.parse(((await client.callTool({ name: 'get_memories', arguments: { project: 'demo', ids: [saved.memory.id] } })).content as { text: string }[])[0].text);
+    expect(read.results[0].body).toBe('available locally');
+    const report = JSON.parse(((await client.callTool({ name: 'status', arguments: {} })).content as { text: string }[])[0].text);
+    expect(report.namespace).toBeNull(); expect(report.pending).toBe(1);
+  } finally { await client.close(); await server.stop(true); rmSync(dir, { recursive: true, force: true }); }
+}, 15000);

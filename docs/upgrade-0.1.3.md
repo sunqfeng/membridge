@@ -1,5 +1,7 @@
 # 升级到 0.1.3
 
+下述首次自动识别需要联网的限制已在 [0.1.4](upgrade-0.1.4.md) 修复。
+
 先备份专用 MySQL 和客户端缓存，再升级服务端，最后升级 MCP 与已安装 skill。旧版本部署/缓存迁移参见 upgrade-0.1.1.md。运行 doctor 检查服务版本；旧服务未声明 access 时新客户端不提交云写入。
 
 服务启动幂等创建排序索引 mb_memories_recent(namespace,project,deleted,updated_at,id)，迁移账号需要 INDEX 权限；保留生成列所需的 ALTER。索引不改变记录，回滚服务可保留索引，仍没有全文检索。客户端新增 cloud_identity/rebase_previews 表，保留原 outbox；回滚程序可忽略新表，但 namespace 自动绑定后的 profile 与旧版本不兼容，回滚客户端应恢复升级前备份，不能让旧版回写新缓存。
