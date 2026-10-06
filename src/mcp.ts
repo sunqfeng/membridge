@@ -4,10 +4,12 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { LocalClient } from './client';
-import { AppError, draftSchema, searchSchema, getSchema, timelineSchema, projectSchema } from './model';
+import { AppError, draftSchema, searchSchema, recentSchema, getSchema, timelineSchema, projectSchema } from './model';
+import { bodyPages } from './body-pages';
 import { selectCachePath } from './cache';
 import { VERSION } from './version';
 import { diagnostic } from './diagnostics';
+import { clientConfig } from './config';
 
 export function createMcp(client: LocalClient) {
   const server = new McpServer({ name: 'membridge', version: VERSION }, {
@@ -23,13 +25,17 @@ export function createMcp(client: LocalClient) {
     description: 'Search local fresh cache first, then shared cloud. Returns compact IDs, titles, versions, freshness and sync state. refresh=true checks cloud now.',
     inputSchema: searchSchema.extend({ refresh: z.boolean().default(false) }).shape, annotations: read,
   }, args => { const { refresh, ...request } = args; return safe(() => client.search(request, refresh)); });
+  server.registerTool('recent', {
+    description: 'Recent project memory indexes without a keyword. Optional kind filter; excludes expired/deleted items. refresh=true checks cloud now; offline results may be incomplete.',
+    inputSchema: recentSchema.extend({ refresh: z.boolean().default(false) }).shape, annotations: read,
+  }, args => { const { refresh, ...request } = args; return safe(() => client.recent(request, refresh)); });
   server.registerTool('get_memories', {
-    description: 'Fetch details for selected IDs after search. Same project required. Bodies have a shared character budget; truncated=true means more evidence remains.',
-    inputSchema: getSchema.extend({ refresh: z.boolean().default(false), charBudget: z.number().int().min(1000).max(32000).default(12000) }).shape, annotations: read,
+    description: 'Fetch selected details with a shared body budget, redistributing unused space. offset applies to each body in UTF-16 units. For truncated content, request its ID alone with offset=nextOffset; restart at 0 if version changed.',
+    inputSchema: getSchema.extend({ refresh: z.boolean().default(false), charBudget: z.number().int().min(1000).max(32000).default(12000), offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0) }).shape, annotations: read,
   }, args => safe(async () => {
     const result = await client.get(args.project, args.ids, args.refresh);
-    const perBody = Math.max(1, Math.floor(args.charBudget / Math.max(1, result.results.length)));
-    return { ...result, results: result.results.map(memory => ({ ...memory, body: memory.body.slice(0, perBody), truncated: memory.body.length > perBody })) };
+    const ordered = [...new Set(args.ids)].flatMap(id => result.results.filter(memory => memory.id === id));
+    return { ...result, results: bodyPages(ordered, args.charBudget, args.offset) };
   }));
   server.registerTool('timeline', {
     description: 'Cloud chronological indexes around a selected ID in the same project. Requires connectivity.',
@@ -54,23 +60,19 @@ export function createMcp(client: LocalClient) {
     description: 'Discard an unsynced local change after explicit user choice. Does not fetch cloud details; call get_memories(refresh=true) afterward. Does not delete cloud records.',
     inputSchema: { project: projectSchema, id: z.uuid() }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
   }, args => safe(() => client.discardPending(args.project, args.id)));
+  server.registerTool('rebase_pending', {
+    description: 'Preview conflicted put alongside latest cloud memory, preserving local content. After review and explicit confirmation, call again with confirmVersion=expectedVersion to retry. Rejects changed/deleted cloud revisions; never automatically resolves conflicts.',
+    inputSchema: { project: projectSchema, id: z.uuid(), confirmVersion: z.number().int().min(1).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  }, args => safe(() => client.rebasePending(args.project, args.id, args.confirmVersion)));
   return server;
 }
 
-async function main() {
-  const url = process.env.MEMBRIDGE_URL;
-  const token = process.env.MEMBRIDGE_TOKEN;
-  if (Boolean(url) !== Boolean(token)) throw new Error('Set both MEMBRIDGE_URL and MEMBRIDGE_TOKEN');
-  if (url) {
-    const parsed = new URL(url);
-    if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('Invalid cloud URL');
-    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname))) throw new Error('Cloud requires HTTPS; loopback HTTP is allowed for tests');
-  }
-  const agent = projectSchema.parse(process.env.MEMBRIDGE_AGENT ?? 'local-agent');
-  const namespace = projectSchema.parse(process.env.MEMBRIDGE_NAMESPACE ?? 'owner');
+export async function startMcp() {
+  const { url, token, agent, namespace, ttlMs } = clientConfig();
   const legacyPath = process.env.MEMBRIDGE_LEGACY_CACHE_PATH;
   const cachePath = process.env.MEMBRIDGE_CACHE_PATH ?? selectCachePath(join(homedir(), '.membridge'), { url, token, namespace, agent, legacyPath });
-  const client = new LocalClient(cachePath, { url, token, namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs: Number(process.env.MEMBRIDGE_CACHE_TTL_MS ?? '60000') });
+  const client = new LocalClient(cachePath, { url, token, namespace, agent, migrateLegacy: Boolean(legacyPath) || process.env.MEMBRIDGE_IMPORT_LEGACY === 'true', ttlMs });
   const server = createMcp(client);
   // Retry bounded batches; conflicts remain for deliberate resolution.
   void client.sync().catch(error => diagnostic('MemBridge initial sync failed', error));
@@ -80,4 +82,4 @@ async function main() {
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
   await server.connect(new StdioServerTransport());
 }
-if (import.meta.main) main().catch(error => { diagnostic('MemBridge MCP startup failed', error); process.exit(1); });
+if (import.meta.main) startMcp().catch(error => { diagnostic('MemBridge MCP startup failed', error); process.exit(1); });

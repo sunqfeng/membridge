@@ -1,6 +1,6 @@
 {
   "name": "membridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Local-first shared memory for agents, backed by your own MySQL cloud.",
   "type": "module",
@@ -8,6 +8,7 @@
   "scripts": {
     "server": "bun src/server.ts",
     "mcp": "bun src/mcp.ts",
+    "doctor": "bun src/cli.ts doctor",
     "test": "bun test tests",
     "typecheck": "tsc --noEmit",
     "test:mysql": "bun test tests/mysql.integration.test.ts"

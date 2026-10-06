@@ -3,7 +3,7 @@
 status 返回操作的 project、memory_id、kind、status，不返回正文。
 
 - pending：网络不可用或临时故障。恢复后 sync；运行中的 MCP 每 30 秒重试一批。
-- conflict：其他 agent 更新/删除该 ID。客户端优先展示未解决的本地修改，即使 refresh=true。先保留本地正文供用户审阅，经用户选择 discard_pending 后再刷新云端；也可用另一个授权客户端比较云端事实。
+- conflict：其他 agent 更新/删除该 ID。客户端优先展示未解决的本地修改，即使 refresh=true。put 冲突先用 rebase_pending(project,id) 预览本地/云端正文；仅在审阅并确认保留本地内容后，带 confirmVersion=expectedVersion 再调用，版本变化则重新预览。不得为了消除 conflict 自动确认覆盖。云端已删除/过期或 forget 冲突不能这样重投。用户决定放弃本地修改时才 discard_pending，之后刷新云端。
 - blocked：认证/项目权限失败。修复权限后 sync(retryFailed=true)，保留并重试原操作。不会自动反复请求被拒绝的权限。
 - rejected：输入被云端拒绝。检查限制；若服务器规则已修正，可 sync(retryFailed=true)。必须改正文时先让用户审阅原内容，明确选择 discard_pending 后重新提交。
 
