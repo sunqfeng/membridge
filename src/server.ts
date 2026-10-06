@@ -2,12 +2,16 @@ import { readFileSync } from 'node:fs';
 import { mysqlDatabase } from './database';
 import { createHandler, tokenSchema } from './http';
 import { MemoryStore } from './store';
+import { createHash } from 'node:crypto';
+import { AppError } from './model';
+import { diagnostic } from './diagnostics';
 
 async function main() {
-  if (!process.env.MYSQL_URL || !process.env.MEMBRIDGE_TOKENS_FILE) throw new Error('MYSQL_URL and MEMBRIDGE_TOKENS_FILE are required');
+  if (!process.env.MYSQL_URL || !process.env.MEMBRIDGE_TOKENS_FILE) throw new AppError('SERVER_CONFIGURATION_REQUIRED');
   const tokens = tokenSchema.parse(JSON.parse(readFileSync(process.env.MEMBRIDGE_TOKENS_FILE, 'utf8')));
-  if (tokens.some(item => item.token.includes('REPLACE_'))) throw new Error('Replace placeholder tokens');
-  if (new Set(tokens.map(item => item.token)).size !== tokens.length) throw new Error('Duplicate agent token');
+  if (tokens.some(item => item.token?.includes('REPLACE_'))) throw new AppError('PLACEHOLDER_TOKEN');
+  if (new Set(tokens.map(item => item.tokenSha256 ?? createHash('sha256').update(item.token!).digest('hex'))).size !== tokens.length) throw new AppError('DUPLICATE_TOKEN');
+  if (new Set(tokens.map(item => JSON.stringify([item.namespace,item.agent]))).size !== tokens.length) throw new AppError('DUPLICATE_AGENT_IDENTITY');
   const port = Number(process.env.PORT ?? '8787');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
   const store = new MemoryStore(await mysqlDatabase(process.env.MYSQL_URL));
@@ -17,4 +21,4 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
-main().catch(() => { console.error('MemBridge startup failed. Check database connectivity and token configuration.'); process.exit(1); });
+main().catch(error => { diagnostic('MemBridge startup failed', error); process.exit(1); });

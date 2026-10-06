@@ -15,6 +15,7 @@ args = ["C:/ABSOLUTE/PATH/membridge/src/mcp.ts"]
 MEMBRIDGE_URL = "https://memory.example.com"
 MEMBRIDGE_TOKEN = "YOUR_AGENT_TOKEN"
 MEMBRIDGE_AGENT = "codex-main"
+MEMBRIDGE_NAMESPACE = "owner"
 MEMBRIDGE_CACHE_TTL_MS = "60000"
 ```
 
@@ -33,7 +34,8 @@ Linux 改为实际绝对路径；Bun 不在客户端 PATH 时 command 用可执�
       "env": {
         "MEMBRIDGE_URL": "https://memory.example.com",
         "MEMBRIDGE_TOKEN": "YOUR_DISTINCT_AGENT_TOKEN",
-        "MEMBRIDGE_AGENT": "claude-research"
+        "MEMBRIDGE_AGENT": "claude-research",
+        "MEMBRIDGE_NAMESPACE": "owner"
       }
     }
   }
@@ -46,6 +48,8 @@ Linux 改为实际绝对路径；Bun 不在客户端 PATH 时 command 用可执�
 
 工具发现中应有 search、remember、get_memories、sync、status。让 A 在 shared-project 写一条有来源的测试发现并检查 synced；让 B 查询同项目关键词并读详情。若工具缺失、状态 pending 或 cloudStatus=unavailable，不能声称已跨 agent 共享。
 
-缓存默认 `~/.membridge/<身份散列>.db`，绑定 URL/token/agent，默认 60 秒 TTL。可用 MEMBRIDGE_CACHE_PATH 指定绝对文件路径，同身份的多个会话可复用；不同凭据不共用路径。缓存未经加密，依赖 OS 文件权限，磁盘加密由用户环境管理。
+缓存默认 `~/.membridge/<身份散列>.db`，绑定 URL/namespace/agent，与 token 无关，默认 60 秒 TTL。namespace 必须与服务端一致（默认 owner），客户端上传前检查云端身份。轮换 token 保留 outbox，并清除旧凭据下的已同步缓存。0.1.0 数据迁移见 [升级说明](upgrade-0.1.1.md)。
+
+MEMBRIDGE_CACHE_PATH 可指定绝对文件路径，必须放在专用私人目录；Linux 会把该目录设为 700、DB/WAL/SHM 为 600，Windows 依赖用户目录 ACL。缓存未经加密。已同步缓存最多 1000 条/30 天，查询快照最多 500 条/1 天；待同步数据不淘汰。
 
 personal 只是独立项目名，不自动授予全 agent；只给需要个人偏好的 agent 权限。假设与草稿不能仅因为工具允许写入就自动公开给其他 agent。

@@ -23,7 +23,7 @@ cloudStatus=unavailable/not_configured 不等于云端没有记忆；freshness=s
 
 新记录 expectedVersion=0。更新同一事实先刷新详情，复用 ID 并提供当前 version；独立事实用新 ID。重要变化保留来源说明。
 
-检查 syncStatus：synced 表示云操作获确认；pending 仅在本地队列；conflict/blocked/rejected 需要处理。sync 可重试 pending，不强行覆盖冲突。结束时可保存简短进度并检查 status，不承诺其他 agent 已阅读。
+检查 syncStatus：synced 表示云操作获确认；pending 仅在本地队列；conflict/blocked/rejected 需要处理。sync 可重试 pending，修正权限/服务器配置后 sync(retryFailed=true) 可重试 blocked/rejected，不强行覆盖冲突。结束时可保存简短进度并检查 status，不承诺其他 agent 已阅读。
 
 ## 冲突与删除
 

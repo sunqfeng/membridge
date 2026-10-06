@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { type SqlDatabase, type SqlConnection } from './database';
-import { AppError, active, authorize, createMemory, index, type Principal, type Memory, type Put, type Forget, type Search } from './model';
+import { AppError, active, authorize, authorizeWrite, createMemory, index, type Principal, type Memory, type Put, type Forget, type Search } from './model';
 
 export class MemoryStore {
   constructor(private db: SqlDatabase) {}
@@ -10,7 +10,7 @@ export class MemoryStore {
     await conn.rows(`SELECT project FROM mb_scopes WHERE namespace=? AND project=?${this.db.dialect === 'mysql' ? ' FOR UPDATE' : ''}`, [actor.namespace, project]);
   }
   private async operation<T>(actor: Principal, project: string, memoryId: string, operationId: string, request: unknown, apply: (conn: SqlConnection) => Promise<T>): Promise<T> {
-    authorize(actor, project);
+    authorizeWrite(actor, project);
     const hash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
     return this.db.transaction(async conn => {
       await this.scopeLock(conn, actor, project);
@@ -57,17 +57,44 @@ export class MemoryStore {
   async search(actor: Principal, request: Search) {
     authorize(actor, request.project);
     const query = request.query.toLocaleLowerCase();
-    // Parameterized substring match preserves CJK partial queries. Scan bounded candidates.
     const escaped = query.replace(/[!%_]/g, character => '!' + character);
-    const rows = await this.db.rows("SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND LOWER(payload) LIKE ? ESCAPE '!' ORDER BY updated_at DESC, id DESC LIMIT 300", [actor.namespace, request.project, '%' + escaped + '%']);
-    return rows.map(row => JSON.parse(String(row.payload)) as Memory).filter(memory => active(memory) && (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query)).slice(0, request.limit).map(index);
+    const text = this.db.dialect === 'mysql' ? "CONCAT(COALESCE(search_title,''),CHAR(10),COALESCE(search_body,''))" : "COALESCE(search_title,'') || char(10) || COALESCE(search_body,'')";
+    const results: Memory[] = [];
+    let cursor: { time: number; id: string } | undefined;
+    const now = Date.now();
+    while (results.length < request.limit) {
+      const where = cursor ? ' AND (updated_at<? OR (updated_at=? AND id<?))' : '';
+      const args: (string | number)[] = [actor.namespace, request.project, '%' + escaped + '%'];
+      if (cursor) args.push(cursor.time, cursor.time, cursor.id);
+      const rows = await this.db.rows(`SELECT payload,updated_at,id FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND LOWER(${text}) LIKE ? ESCAPE '!'${where} ORDER BY updated_at DESC,id DESC LIMIT 100`, args);
+      if (!rows.length) break;
+      for (const row of rows) {
+        const memory = JSON.parse(String(row.payload)) as Memory;
+        if (active(memory, now) && (memory.title + '\n' + memory.body).toLocaleLowerCase().includes(query)) results.push(memory);
+        if (results.length === request.limit) break;
+      }
+      const last = rows[rows.length - 1]; cursor = { time: Number(last.updated_at), id: String(last.id) };
+    }
+    return results.map(index);
   }
   async timeline(actor: Principal, project: string, anchor: string, depth: number) {
     const memory = (await this.get(actor, project, [anchor]))[0];
     if (!memory) return [];
-    const before = await this.db.rows('SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND (updated_at<? OR (updated_at=? AND id<?)) ORDER BY updated_at DESC, id DESC LIMIT ' + depth, [actor.namespace, project, memory.updatedAt, memory.updatedAt, anchor]);
-    const after = await this.db.rows('SELECT payload FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND (updated_at>? OR (updated_at=? AND id>?)) ORDER BY updated_at, id LIMIT ' + depth, [actor.namespace, project, memory.updatedAt, memory.updatedAt, anchor]);
-    return [...before.reverse().map(row => JSON.parse(String(row.payload)) as Memory), memory, ...after.map(row => JSON.parse(String(row.payload)) as Memory)].filter(item => active(item)).map(index);
+    const neighbors = async (direction: 'before' | 'after') => {
+      const results: Memory[] = []; let time = memory.updatedAt, id = anchor;
+      const comparison = direction === 'before' ? '<' : '>';
+      const order = direction === 'before' ? 'DESC' : 'ASC';
+      const now = Date.now();
+      while (results.length < depth) {
+        const rows = await this.db.rows(`SELECT payload,updated_at,id FROM mb_memories WHERE namespace=? AND project=? AND deleted=0 AND (updated_at${comparison}? OR (updated_at=? AND id${comparison}?)) ORDER BY updated_at ${order},id ${order} LIMIT 100`, [actor.namespace, project, time, time, id]);
+        if (!rows.length) break;
+        for (const row of rows) { const item = JSON.parse(String(row.payload)) as Memory; if (active(item, now)) results.push(item); if (results.length === depth) break; }
+        const last = rows[rows.length - 1]; time = Number(last.updated_at); id = String(last.id);
+      }
+      return results;
+    };
+    const before = await neighbors('before'), after = await neighbors('after');
+    return [...before.reverse(), memory, ...after].map(index);
   }
   close() { return this.db.close(); }
 }

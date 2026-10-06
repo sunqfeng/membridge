@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022", "module": "Preserve", "moduleResolution": "bundler",
-    "strict": true, "noEmit": true, "esModuleInterop": true, "skipLibCheck": true,
+    "strict": true, "noEmit": true, "esModuleInterop": true, "skipLibCheck": true, "resolveJsonModule": true,
     "types": ["bun"]
   },
   "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]

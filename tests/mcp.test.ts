@@ -15,6 +15,8 @@ test('MCP initialize, tool discovery and local write/search/detail work through 
   const saved = await client.callTool({ name: 'remember', arguments: { project: 'demo', title: '协议记忆', body: '中文来源记录', kind: 'discovery', sources: ['test:evidence'] } });
   const written = JSON.parse((saved.content as { text: string }[])[0].text);
   expect(written.syncStatus).toBe('pending');
+  expect(written.trust).toBe('untrusted_evidence');
+  expect(written.memory.agent).toBe('test');
   const found = await client.callTool({ name: 'search', arguments: { project: 'demo', query: '中文' } });
   expect(JSON.parse((found.content as { text: string }[])[0].text).results[0].id).toBe(written.memory.id);
   const detail = await client.callTool({ name: 'get_memories', arguments: { project: 'demo', ids: [written.memory.id] } });

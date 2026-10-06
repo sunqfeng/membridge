@@ -2,7 +2,7 @@
 
 **让多个 Agent 共用你自己的云记忆。** 本地有效缓存优先，缺失/过期查询云端，研究所得先持久化到本地，再同步。
 
-基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.0 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。
+基于 [Claude-Mem](https://github.com/thedotmack/claude-mem) 的分层回忆与部分脱敏代码改造。0.1.1 是可运行的自托管原型：MySQL 云服务、SQLite 本地客户端、MCP、共享 skill。已有安装先读 [升级说明](docs/upgrade-0.1.1.md)。
 
 ```mermaid
 flowchart LR
@@ -44,19 +44,20 @@ bun scripts/install-skill.ts codex
 | timeline | 云端时间线索引 |
 | remember | 本地保存并尝试同步，更新要求当前版本 |
 | forget | 本地隐藏并排队云端删除 |
-| sync / status | 重试 pending，报告冲突和拒绝 |
+| sync / status | 重试 pending；retryFailed=true 重试 blocked/rejected；报告冲突 |
 | discard_pending | 经用户选择丢弃本地操作，不删除云端 |
 
 同项目用稳定 slug，例如 investment-research，不用机器路径。同事实更新复用 ID 和 version，独立事实新 ID。来源、证据日期和有效期由 agent 提供。
 
 ## 行为边界
 
-- 队列跨重启，每 30 秒重试最多 50 项；幂等上传，冲突保留，不强行覆盖。
+- 队列跨重启，启动立即同步，每 30 秒重试最多 50 项；并发请求会补跑；幂等上传，冲突保留，不强行覆盖。
 - TTL 默认 60 秒，最高 1 小时；refresh=true 强制查询。TTL 内不是实时一致。
 - 云故障和零命中分开；旧缓存标明 stale；timeline 需要网络。
-- 中文片段匹配，先取最近 300 个匹配 payload 候选再过滤标题正文，返回最多 30 项。适合小规模首版，不保证全量相关性排名，尚无向量语义检索。
+- 中文片段匹配，只查询标题和正文的生成列，分页到足够有效结果或穷尽，返回最多 30 项，按最近更新排序。引号/换行可匹配；尚无全文索引和向量语义检索，大库扫描可能较慢。
 - 删除清正文与回执正文、保留墓碑；其他离线缓存、聊天上下文、用户备份不立即清除。
 - 脱敏在本地及云端写入前执行，不保证覆盖所有秘密。
+- 令牌支持 ro/rw（默认 rw）及服务端 tokenSha256；MCP 返回标为 untrusted_evidence，记忆包含作者 agent。
 - 不自动监听私人聊天、不调用后台付费模型、不自动注入全部新聊天；通过 skill 引导显式提炼。
 - 服务为单实例原型，每 agent 每分钟 120 请求，内存限流重启重置。暂无控制台、分布式限流和高可用部署。
 

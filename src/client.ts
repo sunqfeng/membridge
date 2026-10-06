@@ -1,11 +1,9 @@
 import { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { cacheIdentity, legacyIdentity, secureCache } from './cache';
 import { AppError, active, createMemory, index, type Memory, type IndexEntry, type Search, type Put, type Forget, type draftSchema } from './model';
 import type { z } from 'zod';
 
-type Options = { url?: string; token?: string; agent: string; ttlMs?: number; fetch?: typeof fetch; now?: () => number };
+type Options = { url?: string; token?: string; namespace?: string; agent: string; migrateLegacy?: boolean; ttlMs?: number; fetch?: typeof fetch; now?: () => number };
 type QueueRow = { operation_id: string; project: string; memory_id: string; kind: 'put' | 'forget'; payload: string; status: string };
 type Cached = { payload: string; fetched_at: number; pending: number };
 type SearchReply = { results: IndexEntry[]; source: 'local' | 'cloud'; cloudStatus: 'fresh' | 'not_checked' | 'unavailable' | 'not_configured'; freshness: 'fresh' | 'stale'; pendingIds: string[] };
@@ -16,25 +14,51 @@ export class LocalClient {
   private now: () => number;
   private ttlMs: number;
   private syncing?: Promise<ReturnType<LocalClient['status']>>;
+  private syncRequested = false;
+  private retryFailedRequested = false;
+  private verified = false;
   constructor(path: string, private options: Options) {
-    if (path !== ':memory:') mkdirSync(dirname(resolve(path)), { recursive: true });
+    secureCache(path);
     this.db = new Database(path);
-    this.db.run('PRAGMA journal_mode=WAL');
     this.db.run('PRAGMA busy_timeout=5000');
+    this.db.run('PRAGMA journal_mode=WAL');
     this.db.run('CREATE TABLE IF NOT EXISTS profile (id INTEGER PRIMARY KEY, identity TEXT NOT NULL)');
     this.db.run('CREATE TABLE IF NOT EXISTS cache (project TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL, pending INTEGER NOT NULL, PRIMARY KEY(project,id))');
     this.db.run('CREATE TABLE IF NOT EXISTS snapshots (project TEXT NOT NULL, key TEXT NOT NULL, payload TEXT NOT NULL, fetched_at INTEGER NOT NULL, PRIMARY KEY(project,key))');
     this.db.run('CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE, project TEXT NOT NULL, memory_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'pending\')');
-    const identity = createHash('sha256').update(JSON.stringify([options.url, options.token, options.agent])).digest('hex');
+    const identity = cacheIdentity(options.url, options.namespace ?? 'owner', options.agent);
     const previous = this.db.query('SELECT identity FROM profile WHERE id=1').get() as { identity: string } | null;
-    if (previous && previous.identity !== identity) { this.db.close(); throw new AppError('CACHE_IDENTITY_MISMATCH'); }
+    const oldIdentity = legacyIdentity(options.url, options.token, options.agent);
+    if (previous && previous.identity !== identity && previous.identity !== oldIdentity && !options.migrateLegacy) { this.db.close(); throw new AppError('CACHE_IDENTITY_MISMATCH_USE_EXPLICIT_LEGACY_IMPORT'); }
+    if (previous && previous.identity !== identity) this.db.query('UPDATE profile SET identity=? WHERE id=1').run(identity);
     this.db.query('INSERT OR IGNORE INTO profile(id,identity) VALUES(1,?)').run(identity);
+    this.db.run('CREATE TABLE IF NOT EXISTS credentials (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL)');
+    const credential = this.db.query('SELECT fingerprint FROM credentials WHERE id=1').get() as { fingerprint: string } | null;
+    if (credential?.fingerprint !== oldIdentity) {
+      // Keep unsent work, but never serve synced data cached under previous credentials.
+      this.db.run('DELETE FROM cache WHERE pending=0'); this.db.run('DELETE FROM snapshots');
+      this.db.run("UPDATE outbox SET status='pending' WHERE status='blocked'");
+      this.db.query('INSERT INTO credentials(id,fingerprint) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint').run(oldIdentity);
+    }
+    secureCache(path);
     this.ttlMs = options.ttlMs ?? 60000;
     if (!Number.isFinite(this.ttlMs) || this.ttlMs < 0 || this.ttlMs > 3600000) { this.db.close(); throw new AppError('INVALID_CACHE_TTL'); }
     this.requestFetch = options.fetch ?? fetch;
     this.now = options.now ?? Date.now;
   }
   private configured() { return !!this.options.url && !!this.options.token; }
+  private async verifyIdentity() {
+    if (this.verified || !this.configured()) return;
+    const identity = await this.call<{ namespace: string; agent: string }>('identity', {});
+    if (identity.namespace !== (this.options.namespace ?? 'owner') || identity.agent !== this.options.agent) throw new AppError('CLOUD_IDENTITY_MISMATCH', 403);
+    this.verified = true;
+  }
+  private prune() {
+    this.db.query('DELETE FROM cache WHERE pending=0 AND fetched_at<?').run(this.now() - 30 * 86400000);
+    this.db.run('DELETE FROM cache WHERE pending=0 AND rowid NOT IN (SELECT rowid FROM cache WHERE pending=0 ORDER BY fetched_at DESC LIMIT 1000)');
+    this.db.query('DELETE FROM snapshots WHERE fetched_at<?').run(this.now() - 86400000);
+    this.db.run('DELETE FROM snapshots WHERE rowid NOT IN (SELECT rowid FROM snapshots ORDER BY fetched_at DESC LIMIT 500)');
+  }
   private async call<T>(path: string, payload: unknown): Promise<T> {
     if (!this.configured()) throw new AppError('CLOUD_NOT_CONFIGURED', 503);
     let response: Response;
@@ -54,6 +78,7 @@ export class LocalClient {
   private cachedPut(memory: Memory, pending: boolean) {
     this.db.query('INSERT INTO cache(project,id,payload,fetched_at,pending) VALUES(?,?,?,?,?) ON CONFLICT(project,id) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at,pending=excluded.pending WHERE cache.pending=0 OR excluded.pending=1')
       .run(memory.project, memory.id, JSON.stringify(memory), this.now(), Number(pending));
+    this.prune();
   }
   private clearSnapshots(project: string) { this.db.query('DELETE FROM snapshots WHERE project=?').run(project); }
   private unresolved(project: string, id: string) { return !!this.db.query('SELECT operation_id FROM outbox WHERE project=? AND memory_id=? LIMIT 1').get(project, id); }
@@ -89,9 +114,21 @@ export class LocalClient {
     await this.sync();
     return { id, syncStatus: this.syncStatus(project, id) };
   }
-  sync(): Promise<ReturnType<LocalClient['status']>> {
+  sync(options: { retryFailed?: boolean } = {}): Promise<ReturnType<LocalClient['status']>> {
+    this.syncRequested = true;
+    this.retryFailedRequested ||= options.retryFailed ?? false;
     if (this.syncing) return this.syncing;
-    this.syncing = this.drain().finally(() => { this.syncing = undefined; });
+    this.syncing = (async () => {
+      do {
+        this.syncRequested = false;
+        if (this.retryFailedRequested) {
+          this.db.run("UPDATE outbox SET status='pending' WHERE status IN ('blocked','rejected')");
+          this.retryFailedRequested = false; this.verified = false;
+        }
+        await this.drain();
+      } while (this.syncRequested);
+      return this.status();
+    })().finally(() => { this.syncing = undefined; });
     return this.syncing;
   }
   private async drain() {
@@ -99,6 +136,7 @@ export class LocalClient {
     const rows = this.db.query("SELECT * FROM outbox WHERE status='pending' ORDER BY seq LIMIT 50").all() as QueueRow[];
     for (const row of rows) {
       try {
+        await this.verifyIdentity();
         const result = await this.call<Memory | { deleted: true }>(row.kind, JSON.parse(row.payload));
         this.db.transaction(() => {
           this.db.query('DELETE FROM outbox WHERE operation_id=?').run(row.operation_id);
@@ -118,7 +156,7 @@ export class LocalClient {
           this.db.query("UPDATE outbox SET status='conflict' WHERE operation_id=?").run(row.operation_id);
         } else if (error.status === 401 || error.status === 403) {
           this.db.query("UPDATE outbox SET status='blocked' WHERE operation_id=?").run(row.operation_id);
-        } else if (error.status >= 400 && error.status < 500 && error.status !== 429) {
+        } else if (error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status)) {
           this.db.query("UPDATE outbox SET status='rejected' WHERE operation_id=?").run(row.operation_id);
         } else break;
       }
@@ -131,7 +169,7 @@ export class LocalClient {
     return { pending, hidden: new Set(rows.map(row => row.memory_id)), pendingIds: rows.map(row => row.memory_id) };
   }
   private offline(error: unknown) {
-    if (!(error instanceof AppError) || error.status < 500 && error.status !== 429) throw error;
+    if (!(error instanceof AppError) || error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
   }
   async search(request: Search, refresh = false): Promise<SearchReply> {
     const key = JSON.stringify([request.query, request.limit]);
@@ -142,9 +180,11 @@ export class LocalClient {
     let fresh = !!snapshot && this.now() - snapshot.fetched_at < this.ttlMs;
     if (refresh || !fresh || results.length === 0) {
       try {
+        await this.verifyIdentity();
         results = await this.call<IndexEntry[]>('search', request);
         this.db.query('INSERT INTO snapshots(project,key,payload,fetched_at) VALUES(?,?,?,?) ON CONFLICT(project,key) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at').run(request.project, key, JSON.stringify(results), this.now());
         source = 'cloud'; cloudStatus = 'fresh'; fresh = true;
+        this.prune();
       } catch (error) { this.offline(error); cloudStatus = this.configured() ? 'unavailable' : 'not_configured'; }
     }
     const overlay = this.overlays(request.project);
@@ -166,6 +206,7 @@ export class LocalClient {
     }
     if (needed.length) {
       try {
+        await this.verifyIdentity();
         const remote = await this.call<Memory[]>('get', { project, ids: needed });
         this.db.transaction(() => {
           needed.forEach(id => this.db.query('DELETE FROM cache WHERE project=? AND id=? AND pending=0').run(project, id));
@@ -182,6 +223,7 @@ export class LocalClient {
   }
   async timeline(project: string, anchor: string, depth: number) {
     // Timeline is always cloud refreshed, preventing a partial cache from pretending to be complete.
+    await this.verifyIdentity();
     return { results: await this.call<IndexEntry[]>('timeline', { project, anchor, depth }), source: 'cloud' };
   }
   discardPending(project: string, id: string) {
