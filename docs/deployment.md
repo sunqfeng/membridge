@@ -16,6 +16,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON membridge.* TO 'me
 
 0.1.3 启动还会创建 mb_memories_recent(namespace,project,deleted,updated_at,id)，需要 INDEX 权限；成功建好后可以撤销 INDEX。它支持按项目和更新时间排序，LIKE 子串检索仍可能扫描整个项目，不能替代 FULLTEXT。
 
+升级 0.1.5 需重新授予 INDEX，以创建回执定位索引 mb_operations_memory(namespace,project,memory_id)；成功后可以再次撤销。该索引加快 forget 清除回执正文，不删除回执，也不改变幂等语义。
+
 ## 2. 配置服务与 agent
 
 ```sh

@@ -59,9 +59,9 @@ export function createMcp(client: LocalClient) {
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, args => safe(() => client.forget(args.project, args.id, args.expectedVersion)));
   server.registerTool('sync', {
-    description: 'Retry pending cloud writes. retryFailed=true explicitly retries blocked/rejected operations after permission/config fixes. Conflicts are never overwritten.',
+    description: 'Retry pending cloud writes with at most four requests in flight. Wait up to two seconds, then report current status while background sync continues. retryFailed=true retries blocked/rejected operations after permission/config fixes. Conflicts are never overwritten.',
     inputSchema: { retryFailed: z.boolean().default(false) }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-  }, args => safe(() => client.sync(args)));
+  }, args => safe(() => client.syncWithBudget(args)));
   server.registerTool('status', { description: 'Report cloud configuration and pending/conflicting operation IDs without memory contents.', inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } }, () => safe(() => client.status()));
   server.registerTool('discard_pending', {
     description: 'Discard an unsynced local change after explicit user choice. Does not fetch cloud details; call get_memories(refresh=true) afterward. Does not delete cloud records.',

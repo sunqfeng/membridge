@@ -1,6 +1,8 @@
-# 使用体验与一致性（0.1.3）
+# 使用体验与一致性（0.1.5）
 
 0.1.2 引入详情分页、recent、冲突重投与 doctor；0.1.3 补上确认令牌、版本/正文绑定、排序索引、运行时 namespace 识别及权限修复。不引入全文检索、生命周期迁移或 npm 发布。
+
+0.1.4 支持首次离线启动；0.1.5 让空结果遵守 TTL、读取详情保留查询快照，服务端在 LIMIT 前过滤过期记忆，recent/timeline 不传正文。同步最多 4 个请求并发，前台写入后的同步阶段和 MCP sync 最多等待 2 秒，返回 pending 后后台继续执行。完整升级边界见 [0.1.5 升级说明](upgrade-0.1.5.md)。
 
 get_memories 的 offset 默认 0，仍共享 charBudget，短正文剩余额度重新分配。每条返回 offset、totalLength、nextOffset、bodyHash 和 truncated。读取余文必须单独指定该 ID、nextOffset 和首段 version；建议同时传首段 bodyHash，待同步内容续读必须传 bodyHash，避免本地修改与云端基础版本号相同导致混合。云端续读刷新详情，不可验证版本时失败；版本/正文变化返回 PAGINATION_VERSION_CHANGED。偏移按 UTF-16 单元，边界落在代理对中间时回退 1 单元，不输出孤立代理字符。
 
