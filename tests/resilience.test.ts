@@ -80,7 +80,7 @@ test('bootstrap authentication failures remain fatal instead of silently switchi
   for (const status of [401, 403]) await expect(resolveRuntimeIdentity(config, null, (async () => Response.json({}, { status })) as unknown as typeof fetch)).rejects.toThrow('IDENTITY_HTTP_' + status);
 });
 
-test('black-hole identity consumes only one real request timeout per remember', async () => {
+test('first black-hole identity shares the two-second foreground budget and persists a local draft', async () => {
   let requests = 0;
   const blackHole = ((_: unknown, init?: RequestInit) => {
     requests++;
@@ -90,13 +90,69 @@ test('black-hole identity consumes only one real request timeout per remember', 
   try {
     const started = performance.now();
     expect((await client.remember(draft('saved despite timeout'))).syncStatus).toBe('pending');
-    expect(requests).toBe(1); expect(performance.now() - started).toBeLessThan(14000);
+    expect(requests).toBe(1); expect(performance.now() - started).toBeLessThan(4000);
+    expect(client.status().pending).toBe(1); expect(client.status().access).toBe('unknown');
   } finally { client.close(); }
 }, 15000);
 
 test('redaction preserves ports and paths containing @ while still removing URL passwords', () => {
   for (const url of ['http://localhost:3000/@vite/client', 'https://example.com:8443/docs/@scope/pkg']) expect(redact(url)).toBe(url);
-  for (const url of ['mysql://user:secret@host:3306/db', 'redis://:secret@host:6379/0']) {
+  for (const url of ['mysql://user:secret@host:3306/db', 'redis://:secret@host:6379/0', 'https://user:secret%2Fvalue@host/path']) {
     expect(redact(url)).not.toContain('secret'); expect(redact(url)).toContain('[redacted]@host');
   }
+  expect(redact('https://user:pa/ss@host')).toBe('https://user:pa/ss@host'); // Documented malformed-userinfo boundary.
 });
+
+test.each(['rw', 'ro'] as const)('late identity %s gates cloud upload after foreground deadline', async access => {
+  const token = 't'.repeat(40), store = new MemoryStore(sqliteDatabase(':memory:'));
+  const handle = createHandler(store, [{ namespace: 'team', agent: 'a', projects: ['demo'], token, access }]);
+  let release!: () => void, identities = 0, puts = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const transport = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith('/identity')) { identities++; await gate; }
+    if (String(input).endsWith('/put')) puts++;
+    return handle(new Request(input, init));
+  }) as typeof fetch;
+  const client = new LocalClient(':memory:', { url: 'http://localhost', token, agent: 'a', fetch: transport });
+  try {
+    const started = performance.now(), saved = await client.remember(draft('waiting for identity'));
+    expect(performance.now() - started).toBeLessThan(4000); expect(saved.syncStatus).toBe('pending');
+    expect(identities).toBe(1); expect(puts).toBe(0);
+    const completion = client.sync({ retryIdentity: false }); release(); await completion;
+    expect(client.status().access).toBe(access); expect(puts).toBe(access === 'rw' ? 1 : 0);
+    expect(client.status().pending).toBe(0); expect(client.status().blocked).toBe(access === 'ro' ? 1 : 0);
+    expect((await client.get('demo', [saved.memory!.id])).results[0].body).toBe('waiting for identity');
+  } finally { release(); client.close(); await store.close(); }
+}, 7000);
+
+test('persisted read-only access rejects offline remember before waiting or queueing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'membridge-ro-budget-')), path = join(root, 'cache.db');
+  const config = { url: 'http://localhost', token: 'r'.repeat(40), agent: 'a' };
+  let client = new LocalClient(path, { ...config, fetch: (async () => Response.json({ namespace: 'team', agent: 'a', access: 'ro' })) as unknown as typeof fetch });
+  try {
+    await client.sync(); client.close();
+    let calls = 0;
+    client = new LocalClient(path, { ...config, fetch: (async () => { calls++; throw new Error('offline'); }) as unknown as typeof fetch });
+    await expect(client.remember(draft('read only'))).rejects.toThrow('READ_ONLY_CREDENTIAL');
+    expect(calls).toBe(0); expect(client.status().operations).toEqual([]);
+  } finally { client.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('slow identity and upload consume one shared budget instead of two separate waits', async () => {
+  let identities = 0, puts = 0;
+  const transport = (async (input: unknown, init?: RequestInit) => {
+    if (String(input).endsWith('/identity')) {
+      identities++; await new Promise(resolve => setTimeout(resolve, 1100));
+      return Response.json({ namespace: 'team', agent: 'a', access: 'rw' });
+    }
+    puts++;
+    return new Promise<Response>((_, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('closed')), { once: true }));
+  }) as typeof fetch;
+  const client = new LocalClient(':memory:', { url: 'http://localhost', token: 't'.repeat(40), agent: 'a', fetch: transport });
+  try {
+    const started = performance.now(), saved = await client.remember(draft('one budget'));
+    expect(performance.now() - started).toBeLessThan(2800); expect(saved.syncStatus).toBe('pending');
+    expect(identities).toBe(1); expect(puts).toBe(1);
+    const completion = client.sync({ retryIdentity: false }); client.close(); await completion;
+  } finally { client.close(); }
+}, 6000);
