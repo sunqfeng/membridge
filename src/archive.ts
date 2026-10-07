@@ -1,6 +1,8 @@
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { createMemory, putSchema, type MemoryInput, type Put } from './model';
+import type { Principal } from './model';
+import type { MemoryStore } from './store';
 
 export type ArchiveEntry = { id: string; time: string; type: string; text: string; phase?: string };
 export type ArchiveConversation = { threadId: string; title: string; cwd: string; createdAt: string; entries: ArchiveEntry[] };
@@ -43,6 +45,7 @@ export class ArchiveQueue {
   needsCapture(thread: string, fingerprint: string) {
     return (this.db.query('SELECT fingerprint FROM archive_threads WHERE id=?').get(thread) as { fingerprint: string } | null)?.fingerprint !== fingerprint;
   }
+  hasThread(thread:string) { return Boolean(this.db.query('SELECT id FROM archive_threads WHERE id=?').get(thread)); }
   private draft(memory: MemoryInput, requests: Put[]) {
     let normalized = createMemory(memory);
     for (let i = 0; i < 5; i++) {
@@ -60,8 +63,10 @@ export class ArchiveQueue {
   }
   private enqueue(requests: Put[]) {
     if (!requests.length) return;
-    const payload = requests.map(r => JSON.stringify(r)).join('\n') + '\n', sha256 = archiveHash(payload);
-    this.db.query('INSERT INTO archive_queue(id,sha256,payload) VALUES(?,?,?)').run(uuid('archive-batch:' + sha256), sha256, payload);
+    for(let n=0;n<requests.length;n+=100){
+      const payload = requests.slice(n,n+100).map(r => JSON.stringify(r)).join('\n') + '\n', sha256 = archiveHash(payload);
+      this.db.query('INSERT INTO archive_queue(id,sha256,payload) VALUES(?,?,?)').run(uuid('archive-batch:' + sha256), sha256, payload);
+    }
   }
   capture(c: ArchiveConversation, fingerprint: string) {
     return this.db.transaction(() => {
@@ -69,7 +74,7 @@ export class ArchiveQueue {
       const state = this.db.query('SELECT base_ids,delta_ids FROM archive_threads WHERE id=?').get(c.threadId) as { base_ids: string; delta_ids: string };
       const requests: Put[] = [], changes: string[] = [];
       for (const e of c.entries) {
-        if (e.type !== 'user' && e.type !== 'assistant' && !e.type.startsWith('tool:')) throw new Error('ARCHIVE_NON_VISIBLE_ITEM');
+        if ((e.type !== 'user' && e.type !== 'assistant' && !e.type.startsWith('tool:')) || (e.phase && !['final','final_answer','commentary'].includes(e.phase))) throw new Error('ARCHIVE_NON_VISIBLE_ITEM');
         const old = this.db.query('SELECT hash FROM archive_items WHERE thread=? AND id=?').get(c.threadId, e.id) as { hash: string } | null;
         const hash = entryHash(e); if (old?.hash === hash) continue;
         changes.push(`[${e.time}] ${e.type} item_id=${e.id} ${old ? '修订：替代该 item_id 的旧文本' : '新增'}\n${e.text}`);
@@ -113,4 +118,24 @@ export class ArchiveQueue {
   }
   status() { return this.db.query('SELECT COUNT(*) AS batches,COALESCE(SUM(LENGTH(payload)),0) AS queuedChars FROM archive_queue').get() as { batches:number;queuedChars:number }; }
   close() { this.db.close(); }
+}
+
+export async function applyArchiveBatch(store:MemoryStore,actor:Principal,input:Put[]) {
+  const allowed = ['codex-history','codex-history-index','codex-knowledge'];
+  const requests=input.map(r=>putSchema.parse(r));
+  if(requests.some(r=>!allowed.includes(r.memory.project)||!r.memory.sources.includes('archive:codex-visible-incremental-v1')||JSON.stringify(createMemory(r.memory))!==JSON.stringify(r.memory)))throw new Error('INVALID_ARCHIVE_RECORD');
+  for(const r of requests)await store.put(actor,r);
+  let verified=0;
+  for(const project of allowed){
+    const list=requests.filter(r=>r.memory.project===project);
+    for(let n=0;n<list.length;n+=20){
+      const batch=list.slice(n,n+20),found=new Map((await store.get(actor,project,batch.map(r=>r.memory.id))).map(m=>[m.id,m]));
+      for(const r of batch){
+        const m=found.get(r.memory.id);
+        if(!m||m.agent!==actor.agent||m.version!==r.expectedVersion+1||m.title!==r.memory.title||m.body!==r.memory.body||JSON.stringify(m.sources)!==JSON.stringify(r.memory.sources))throw new Error('ARCHIVE_READBACK_MISMATCH');
+        verified++;
+      }
+    }
+  }
+  return verified;
 }
